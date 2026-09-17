@@ -38,7 +38,22 @@ func testBrokers() []string {
 
 func TestPublishConsumeRoundTrip(t *testing.T) {
 	brokers := testBrokers()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 60s, not 10s: this one context has to cover creating a topic,
+	// publishing, AND a brand-new consumer group's first rebalance
+	// against a partition it has never read. That last part is the slow,
+	// variable one -- a cold group has to find the coordinator, join, and
+	// get its assignment before Next can return anything. On a laptop
+	// that fits in 10s; on a CI runner sharing a box it intermittently
+	// does not, which showed up as "Next: fetch: context deadline
+	// exceeded" on runs whose Go code was byte-identical to runs that
+	// passed.
+	//
+	// Raising it does not weaken the test. Nothing here asserts on
+	// latency -- the assertions are that the RunID round-trips and the
+	// trace context survives the headers. A timeout is the backstop for
+	// "this will never complete", and 60s still fails fast enough to be
+	// useful while no longer failing on a slow rebalance.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	// A fresh, unique TOPIC per test run -- not just a fresh consumer
