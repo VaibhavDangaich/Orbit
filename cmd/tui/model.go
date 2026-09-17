@@ -107,12 +107,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.table.SetWidth(msg.Width)
-		// Leave room for the banner (6 lines), the tagline, the count
+		// Leave room for the banner (5 lines), the tagline, the count
 		// boxes (4 rows + caption), and the help line, plus blank
 		// spacers between sections -- a fixed budget rather than a
 		// perfectly reactive layout, which is plenty for a single-screen
 		// dashboard. See View() for the exact section list this counts.
-		h := msg.Height - 16
+		h := msg.Height - 15
 		if h < 3 {
 			h = 3
 		}
