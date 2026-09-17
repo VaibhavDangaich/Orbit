@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orbit-worker
+  namespace: orbit
+spec:
+  # 3 to start -- unlike the scheduler, every worker replica does real
+  # work simultaneously (Kafka's consumer-group partition assignment and
+  # Postgres's SKIP LOCKED sweep both parallelize across as many workers
+  # as are running, no leader/standby split). The HPA below is what
+  # actually decides the real replica count in practice.
+  replicas: 3
+  selector:
+    matchLabels:
+      app: orbit-worker
+  template:
+    metadata:
+      labels:
+        app: orbit-worker
+    spec:
+      containers:
+        - name: worker
+          image: orbit-worker:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ORBIT_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          envFrom:
+            - configMapRef:
+                name: orbit-config
+            - secretRef:
+                name: orbit-db-credentials
+          ports:
+            - name: metrics
+              containerPort: 9102
+          # Same reused-/metrics-endpoint caveat as orbit-scheduler.yaml.
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orbit-worker
+  namespace: orbit
+  labels:
+    app: orbit-worker
+spec:
+  selector:
+    app: orbit-worker
+  ports:
+    - name: metrics
+      port: 9102
+      targetPort: metrics
+---
+# CPU-based autoscaling: the honest, available signal. The metric that
+# would actually justify scaling workers -- Kafka consumer lag / Postgres
+# pending-run backlog -- needs a custom.metrics.k8s.io adapter reading
+# from Prometheus (prometheus-adapter or KEDA's Kafka scaler), which is
+# real, valuable infrastructure this project doesn't run yet. Documented
+# here rather than faked with a metric this cluster can't actually serve:
+# CPU is a legitimate if blunt proxy (execute() burns CPU while running),
+# and the queue-depth-based upgrade path is named explicitly, not glossed
+# over.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: orbit-worker
+  namespace: orbit
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: orbit-worker
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

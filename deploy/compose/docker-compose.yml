@@ -51,14 +51,25 @@ services:
       # service to run for a single-node setup.
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      # Two client-facing listeners, not one -- the classic "why can't my
+      # client reach Kafka in Docker" gotcha. Kafka's protocol is two-hop:
+      # a client dials any broker, then gets back cluster metadata telling
+      # it the ADVERTISED address to use for the actual request -- and
+      # that address has to already be resolvable from wherever the client
+      # is. A host process and a k8s pod are two different "wheres": the
+      # host resolves "localhost" to itself, a kind pod resolves it to the
+      # pod's own loopback, not the host. One fixed advertised address
+      # can't satisfy both -- hence PLAINTEXT for host processes (TUI,
+      # tests, `go run`) and K8S for pods reaching back out via
+      # host.docker.internal, on two different ports.
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,K8S://:9094
       # Host 19092, not 9092: a machine-local Kafka install is already
       # bound to 9092/9093 on localhost -- the exact same class of
       # collision as the Postgres 5432 issue earlier, caught the same way
       # (checking `lsof` before assuming the default port is free).
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:19092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:19092,K8S://host.docker.internal:19094
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,K8S:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       # Single combined broker+controller process, "localhost" here
       # resolves inside the container's own network namespace (unlike our
@@ -74,6 +85,7 @@ services:
       CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
     ports:
       - "19092:9092"
+      - "19094:9094"
     volumes:
       - kafkadata:/var/lib/kafka/data
     healthcheck:

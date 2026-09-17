@@ -1,0 +1,35 @@
+# Non-secret configuration, shared by both scheduler and worker.
+#
+# All endpoints point at host.docker.internal because this manifest set
+# deliberately does NOT re-deploy Postgres/etcd/Kafka/Redis/Jaeger as
+# Kubernetes objects -- it reuses the already-proven deploy/compose stack
+# running on the host. In production these would be managed services (RDS,
+# MSK, ElastiCache) or installed via the Helm charts their own maintainers
+# publish (bitnami/postgresql, bitnami/kafka, etc.) -- hand-rolling
+# StatefulSets for someone else's database is duplicate effort a real team
+# wouldn't do either, and it isn't where this project's own K8s signal is.
+# What IS this project's own code -- cmd/scheduler and cmd/worker -- gets
+# real Deployment/Service/HPA/PDB manifests.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orbit-config
+  namespace: orbit
+data:
+  ORBIT_ETCD_ENDPOINTS: "host.docker.internal:2379"
+  ORBIT_ELECTION_KEY: "/orbit/scheduler-leader/"
+  ORBIT_ELECTION_TTL: "10s"
+  # 19094, not 19092: Kafka's compose config advertises a SEPARATE K8S
+  # listener on this port specifically for clients reaching in via
+  # host.docker.internal (see docker-compose.yml's kafka service comment
+  # for why one advertised address can't serve both host processes and
+  # k8s pods).
+  ORBIT_KAFKA_BROKERS: "host.docker.internal:19094"
+  ORBIT_KAFKA_PARTITIONS: "3"
+  ORBIT_KAFKA_GROUP: "orbit-workers"
+  ORBIT_REDIS_ADDR: "host.docker.internal:6380"
+  ORBIT_RATE_LIMIT_PER_TENANT: "10"
+  ORBIT_OTLP_ENDPOINT: "host.docker.internal:4317"
+  ORBIT_POLL_INTERVAL: "5s"
+  ORBIT_LEASE: "30s"
+  ORBIT_SWEEP_INTERVAL: "30s"

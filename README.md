@@ -206,6 +206,7 @@ Every one of these is implemented and covered by a test that proves the property
 | **Per-tenant rate limiting without spending retries** | `internal/ratelimit` (Lua-scripted token bucket in Redis), `cmd/worker` (`handleRunID`) | An `EVAL`-atomic token bucket, checked before `ClaimRun` -- proven not to over-admit under concurrency in `TestAllowNoOverAdmitConcurrent`, the same "race for one slot" proof shape as `TestClaimRunsNoDoubleClaim`. A throttled run is deferred to `sweepLoop`, not routed through `FailRun`, so backpressure never spends one of the run's real `MaxAttempts` |
 | **Metrics as a cross-cutting exception to strict containment** | `internal/metrics` | Verified live: real Prometheus scrape of both binaries via `host.docker.internal`, real Grafana query through its own provisioned datasource proxy -- `orbit_runs_claimed_total{path="sweep"}` and `orbit_runs_completed_total{status="succeeded"}` both landed on the exact count of runs actually observed executing, not just a metric that compiles |
 | **Distributed tracing across an async boundary** | `internal/tracing`, `internal/queue/tracing.go` (`kafkaHeaderCarrier`) | HTTP has a standard header slot for trace context and middleware that injects/extracts it automatically; Kafka has neither. `kafkaHeaderCarrier` bridges OpenTelemetry's `propagation.TextMapCarrier` interface to `kafka.Header` slices, so a span started in `cmd/scheduler` survives sitting in a topic and resumes as the parent of a span started in a completely different `cmd/worker` process -- verified live via Jaeger's API: producer (`orbit.runs publish`) and consumer (`orbit.runs consume`) spans share one trace ID with correct parent-child linkage, and `claim_run`/`execute` spans nest correctly underneath |
+| **Two independent self-healing mechanisms composing correctly** | `deploy/k8s/scheduler.yaml` (2 replicas, `PodDisruptionBudget`) | etcd's election and Kubernetes' own reconciliation loop solve *different* failure modes and don't know about each other -- verified live on a real `kind` cluster: deleting the leader pod triggered a graceful `Resign`, the etcd-elected standby took over in ~2s, and, independently, the Deployment controller replaced the deleted pod to restore replica count |
 
 ## Proven under real failure, not just designed for it
 
@@ -412,6 +413,24 @@ All three binaries are configured entirely by environment variables (no config f
 | `ORBIT_TUI_JOB_LIMIT` | `50` | Max jobs shown in the table |
 | `ORBIT_TUI_RUN_WINDOW` | `500` | How many of the most recent runs the status counts are scoped to |
 
+## Kubernetes
+
+`deploy/k8s` has real Deployment/Service/ConfigMap/Secret/PodDisruptionBudget/HorizontalPodAutoscaler manifests for `cmd/scheduler` and `cmd/worker` — not a re-packaging of `deploy/compose`'s infra as YAML. Postgres/etcd/Kafka/Redis/Jaeger stay where `deploy/compose` already runs them; in a real deployment those would be managed services (RDS, MSK, ElastiCache) or installed from the Helm charts their own maintainers publish, not hand-rolled StatefulSets duplicating what a real team wouldn't build either. `deploy/docker/{scheduler,worker}.Dockerfile` are multi-stage builds onto `gcr.io/distroless/static-debian12` — no shell, no package manager, nothing for a CVE scanner to flag but the binary's own dependencies.
+
+```bash
+kind create cluster --name orbit
+docker build -f deploy/docker/scheduler.Dockerfile -t orbit-scheduler:dev .
+docker build -f deploy/docker/worker.Dockerfile -t orbit-worker:dev .
+kind load docker-image orbit-scheduler:dev orbit-worker:dev --name orbit
+kubectl apply -k deploy/k8s
+```
+
+The scheduler runs 2 replicas on purpose — this is the actual point of putting it under a ReplicaSet. `internal/election`'s etcd campaign, not Kubernetes, decides which one does any work; the other sits as a warm standby, already past its own startup+campaign path, ready to take over the instant the leader's session lapses. A `PodDisruptionBudget` (`minAvailable: 1`) keeps a voluntary disruption (a node drain, a cluster upgrade) from evicting both at once. The worker runs behind a CPU-based `HorizontalPodAutoscaler` — an honest, available signal, not the queue-depth-based one that would actually justify scaling (that needs a `custom.metrics.k8s.io` adapter reading Kafka consumer lag from Prometheus, e.g. KEDA's Kafka scaler — real infrastructure this project doesn't run yet, named here rather than faked).
+
+**Verified live, not just applied and assumed correct**: ran both Deployments on a real local `kind` cluster, seeded a job, and watched it materialize → dispatch → consume → execute end to end from inside the cluster. Found and fixed a real bug in the process: Kafka's `KAFKA_ADVERTISED_LISTENERS` was hardcoded to `localhost:19092`, which only ever worked because the scheduler used to run as a host process — inside a pod, "localhost" resolves to the pod itself, not the host machine. Fixed by giving Kafka a second listener (`K8S`, advertised as `host.docker.internal:19094`) specifically for in-cluster clients, the standard multi-listener pattern real Kafka deployments use for internal-vs-external traffic — see `deploy/compose/docker-compose.yml`'s `kafka` service comment. Also proved failover works the same way it did in the original etcd-only demo, now under Kubernetes: deleted the leader pod (`kubectl delete pod`, which sends a graceful `SIGTERM` first) and the standby was elected leader within ~2 seconds via `Resign`, while the Deployment controller independently replaced the deleted pod to restore the replica count — two different self-healing mechanisms (etcd's election, Kubernetes' reconciliation loop) proven to compose correctly rather than assumed to.
+
+**Known gap, stated plainly**: liveness/readiness probes reuse the existing `/metrics` endpoint (a valid "is the HTTP server alive" signal) rather than a dedicated `/healthz` that checks Postgres/etcd/Kafka reachability — a pod can report itself "ready" while unable to reach any of its actual dependencies. A real health-check endpoint distinguishing liveness from dependency-readiness is the natural next step, not built here because the existing endpoint was enough to prove the deployment topology itself works.
+
 ## Project structure
 
 ```
@@ -427,8 +446,11 @@ internal/
   hashring/      consistent hashing, standalone and fully tested on its own
   ratelimit/     the only package that knows Redis exists
   metrics/       the only package that knows Prometheus's client library exists
+  tracing/       the only package that knows the OpenTelemetry SDK exists
 migrations/      versioned SQL, golang-migrate-compatible naming
-deploy/compose/  local dev infrastructure (Postgres, etcd, Kafka, Redis, Prometheus, Grafana)
+deploy/compose/  local dev infrastructure (Postgres, etcd, Kafka, Redis, Prometheus, Grafana, Jaeger)
+deploy/docker/   multi-stage Dockerfiles for cmd/scheduler and cmd/worker
+deploy/k8s/      Deployment/Service/ConfigMap/Secret/PDB/HPA manifests for cmd/scheduler and cmd/worker
 ```
 
 Every `internal/` package is a hard boundary, not a convention: the Go compiler itself blocks any package outside this module from importing it. Each infra dependency (Postgres, etcd, Kafka, Redis, Prometheus) is contained to exactly one package that owns it; nothing else in the codebase imports a driver directly. `internal/metrics` is the one deliberate exception to "one package calls into another via a narrow interface, never a direct import" -- see its doc comment for why a metrics client is a different kind of dependency than a stateful connection pool.
@@ -461,7 +483,7 @@ Stated explicitly rather than glossed over:
 - [x] Redis-backed per-tenant rate limiting
 - [x] Prometheus metrics + Grafana (see "Observability" below)
 - [x] OpenTelemetry distributed tracing across the scheduler → Kafka → worker boundary (see "Observability")
-- [ ] Kubernetes deployment manifests
+- [x] Kubernetes deployment manifests (see "Kubernetes")
 - [ ] Load testing (k6) with published P50/P95/P99 numbers, plus chaos testing (kill -9 everything, prove no loss)
 - [x] A terminal dashboard (`bubbletea`) for live job/run/leader/worker visibility
 
