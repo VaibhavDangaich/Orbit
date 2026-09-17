@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -11,6 +12,11 @@ import (
 )
 
 func mustCreateJob(t *testing.T, s *Store, nextRunAt time.Time) job.Job {
+	t.Helper()
+	return mustCreateJobWithMaxAttempts(t, s, nextRunAt, 3)
+}
+
+func mustCreateJobWithMaxAttempts(t *testing.T, s *Store, nextRunAt time.Time, maxAttempts int) job.Job {
 	t.Helper()
 	sched, err := job.ParseSchedule("@every 30s")
 	if err != nil {
@@ -22,7 +28,7 @@ func mustCreateJob(t *testing.T, s *Store, nextRunAt time.Time) job.Job {
 		Schedule:    sched,
 		Payload:     []byte(`{}`),
 		Enabled:     true,
-		MaxAttempts: 3,
+		MaxAttempts: maxAttempts,
 		NextRunAt:   nextRunAt,
 	})
 	if err != nil {
@@ -155,3 +161,166 @@ func TestClaimRunsNoDoubleClaim(t *testing.T) {
 // "didn't crash this time" isn't the same as "safe." The mutex serializes
 // access to the slice; it has nothing to do with the database locking
 // this test is actually verifying.
+
+func TestCompleteRun(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	mustCreateJob(t, s, now)
+	if _, err := s.MaterializeDueRuns(ctx, now, 10); err != nil {
+		t.Fatalf("MaterializeDueRuns: %v", err)
+	}
+	runs, err := s.ClaimRuns(ctx, "worker-1", 30*time.Second, 1)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("ClaimRuns: runs=%v err=%v", runs, err)
+	}
+
+	if err := s.CompleteRun(ctx, runs[0].ID, "worker-1"); err != nil {
+		t.Fatalf("CompleteRun: %v", err)
+	}
+
+	var status job.RunStatus
+	if err := s.pool.QueryRow(ctx, `SELECT status FROM job_runs WHERE id = $1`, runs[0].ID).Scan(&status); err != nil {
+		t.Fatalf("query status: %v", err)
+	}
+	if status != job.RunSucceeded {
+		t.Errorf("status = %q, want %q", status, job.RunSucceeded)
+	}
+}
+
+// TestCompleteRunFencing is the actual proof of the fencing claim: a
+// worker that is no longer the lease holder must not be able to complete
+// a run someone else now owns.
+func TestCompleteRunFencing(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	mustCreateJob(t, s, now)
+	if _, err := s.MaterializeDueRuns(ctx, now, 10); err != nil {
+		t.Fatalf("MaterializeDueRuns: %v", err)
+	}
+	runs, err := s.ClaimRuns(ctx, "worker-1", 30*time.Second, 1)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("ClaimRuns: runs=%v err=%v", runs, err)
+	}
+
+	// A different worker (never claimed this run) tries to complete it.
+	err = s.CompleteRun(ctx, runs[0].ID, "worker-2")
+	if !errors.Is(err, ErrStale) {
+		t.Fatalf("CompleteRun by non-owner: err = %v, want ErrStale", err)
+	}
+
+	// The real owner's completion must still succeed afterwards -- the
+	// rejected attempt must not have mutated the row at all.
+	if err := s.CompleteRun(ctx, runs[0].ID, "worker-1"); err != nil {
+		t.Fatalf("CompleteRun by real owner: %v", err)
+	}
+}
+
+func TestFailRunRetriesThenTerminates(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	// MaxAttempts=2 keeps this test to two rounds instead of three.
+	mustCreateJobWithMaxAttempts(t, s, now, 2)
+	if _, err := s.MaterializeDueRuns(ctx, now, 10); err != nil {
+		t.Fatalf("MaterializeDueRuns: %v", err)
+	}
+
+	// Round 1: attempt=1 < max_attempts=2 -> goes back to pending.
+	runs, err := s.ClaimRuns(ctx, "worker-1", 30*time.Second, 1)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("ClaimRuns (round 1): runs=%v err=%v", runs, err)
+	}
+	status, err := s.FailRun(ctx, runs[0].ID, "worker-1", "connection refused")
+	if err != nil {
+		t.Fatalf("FailRun (round 1): %v", err)
+	}
+	if status != job.RunPending {
+		t.Fatalf("status after round 1 = %q, want %q (should still have attempts left)", status, job.RunPending)
+	}
+
+	// Round 2: a (possibly different) worker claims the retried run.
+	// attempt is now 2, so attempt < max_attempts (2 < 2) is false ->
+	// this failure must be terminal.
+	runs, err = s.ClaimRuns(ctx, "worker-2", 30*time.Second, 1)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("ClaimRuns (round 2): runs=%v err=%v", runs, err)
+	}
+	if runs[0].Attempt != 2 {
+		t.Fatalf("Attempt = %d, want 2", runs[0].Attempt)
+	}
+	status, err = s.FailRun(ctx, runs[0].ID, "worker-2", "connection refused")
+	if err != nil {
+		t.Fatalf("FailRun (round 2): %v", err)
+	}
+	if status != job.RunFailed {
+		t.Fatalf("status after round 2 = %q, want %q (attempts exhausted)", status, job.RunFailed)
+	}
+}
+
+func TestReapExpiredLeases(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	mustCreateJob(t, s, now)
+	if _, err := s.MaterializeDueRuns(ctx, now, 10); err != nil {
+		t.Fatalf("MaterializeDueRuns: %v", err)
+	}
+
+	// A lease so short it's already expired by the time we check it --
+	// simulating a worker that claimed a run and then died.
+	runs, err := s.ClaimRuns(ctx, "worker-1", 1*time.Millisecond, 1)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("ClaimRuns: runs=%v err=%v", runs, err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	reaped, err := s.ReapExpiredLeases(ctx)
+	if err != nil {
+		t.Fatalf("ReapExpiredLeases: %v", err)
+	}
+	if reaped != 1 {
+		t.Fatalf("reaped = %d, want 1", reaped)
+	}
+
+	// MaxAttempts defaults to 3 in mustCreateJob, attempt was 1 -> retried,
+	// not terminally failed.
+	var status job.RunStatus
+	var claimedBy *string
+	if err := s.pool.QueryRow(ctx, `SELECT status, claimed_by FROM job_runs WHERE id = $1`, runs[0].ID).Scan(&status, &claimedBy); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if status != job.RunPending {
+		t.Errorf("status = %q, want %q", status, job.RunPending)
+	}
+	if claimedBy != nil {
+		t.Errorf("claimed_by = %v, want nil (cleared on retry)", *claimedBy)
+	}
+}
+
+func TestReapExpiredLeasesIgnoresActiveLeases(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	mustCreateJob(t, s, now)
+	if _, err := s.MaterializeDueRuns(ctx, now, 10); err != nil {
+		t.Fatalf("MaterializeDueRuns: %v", err)
+	}
+	if _, err := s.ClaimRuns(ctx, "worker-1", 30*time.Second, 1); err != nil {
+		t.Fatalf("ClaimRuns: %v", err)
+	}
+
+	reaped, err := s.ReapExpiredLeases(ctx)
+	if err != nil {
+		t.Fatalf("ReapExpiredLeases: %v", err)
+	}
+	if reaped != 0 {
+		t.Fatalf("reaped = %d, want 0 (lease still active)", reaped)
+	}
+}

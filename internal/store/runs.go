@@ -2,12 +2,21 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/vaibhavdangaich/orbit/internal/job"
 )
+
+// ErrStale is returned by CompleteRun/FailRun when the update didn't
+// match any row -- meaning the calling worker is no longer the run's
+// lease holder (someone else reclaimed it after the lease expired) or the
+// run was already finished. See the fencing note on CompleteRun.
+var ErrStale = errors.New("store: run not claimed by this worker (lease expired or already finished)")
 
 // MaterializeDueRuns finds up to limit enabled jobs due at or before now,
 // inserts one pending Run for each (collapsing any missed occurrences via
@@ -178,4 +187,105 @@ func (s *Store) ClaimRuns(ctx context.Context, workerID string, lease time.Durat
 		claimed[i].ClaimExpiresAt = &expiresAt
 	}
 	return claimed, nil
+}
+
+// CompleteRun marks a run succeeded -- but only if workerID is still its
+// current lease holder.
+//
+// The WHERE clause (claimed_by = $2 AND status = 'running') is called
+// "fencing," and it's the actual answer to a question every leader-
+// election or lease-based design gets asked: a worker's lease can expire
+// for reasons that have nothing to do with it being dead -- a long GC
+// pause, a slow network blip -- and it might come back and try to report
+// success *after* another worker already reclaimed and finished its run.
+// Without this check, whichever one writes last wins, silently. With it,
+// the database only accepts the write from whoever the CURRENT lease
+// holder is; a stale worker's write matches zero rows and is rejected.
+// The safety doesn't come from the lease timer being accurate -- it comes
+// from this conditional update being the only door in.
+func (s *Store) CompleteRun(ctx context.Context, runID job.RunID, workerID string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE job_runs
+		SET status = 'succeeded', finished_at = now()
+		WHERE id = $1 AND claimed_by = $2 AND status = 'running'`,
+		runID, workerID,
+	)
+	if err != nil {
+		return fmt.Errorf("store: complete run %d: %w", runID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrStale
+	}
+	return nil
+}
+
+// FailRun reports that workerID's execution of runID failed with errMsg.
+// Same fencing as CompleteRun (WHERE claimed_by = $2 AND status =
+// 'running'): a stale worker's failure report is rejected exactly like a
+// stale success report would be.
+//
+// The retry decision -- Job.MaxAttempts is fetched via a join, not passed
+// in by the caller, so a worker can never accidentally under- or
+// over-report it: if Run.Attempt hasn't reached it yet, the SAME row goes
+// back to 'pending' with Attempt incremented (per the contract documented
+// on job.Run -- a second INSERT for this (job_id, scheduled_for) would
+// violate the unique constraint, so retries must reuse the row). Otherwise
+// it becomes terminally 'failed'. The returned status tells the caller
+// which branch happened, for logging.
+func (s *Store) FailRun(ctx context.Context, runID job.RunID, workerID string, errMsg string) (job.RunStatus, error) {
+	var status job.RunStatus
+	err := s.pool.QueryRow(ctx, `
+		UPDATE job_runs AS jr
+		SET
+			status           = CASE WHEN jr.attempt < j.max_attempts THEN 'pending' ELSE 'failed' END,
+			attempt          = CASE WHEN jr.attempt < j.max_attempts THEN jr.attempt + 1 ELSE jr.attempt END,
+			claimed_by       = CASE WHEN jr.attempt < j.max_attempts THEN NULL ELSE jr.claimed_by END,
+			claim_expires_at = CASE WHEN jr.attempt < j.max_attempts THEN NULL ELSE jr.claim_expires_at END,
+			started_at       = CASE WHEN jr.attempt < j.max_attempts THEN NULL ELSE jr.started_at END,
+			finished_at      = CASE WHEN jr.attempt < j.max_attempts THEN NULL ELSE now() END,
+			error            = $3
+		FROM jobs AS j
+		WHERE jr.id = $1 AND jr.claimed_by = $2 AND jr.status = 'running' AND j.id = jr.job_id
+		RETURNING jr.status`,
+		runID, workerID, errMsg,
+	).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrStale
+	}
+	if err != nil {
+		return "", fmt.Errorf("store: fail run %d: %w", runID, err)
+	}
+	return status, nil
+}
+
+// ReapExpiredLeases finds every run still marked 'running' whose lease has
+// expired -- meaning the worker holding it never called CompleteRun or
+// FailRun, most likely because it crashed -- and applies the exact same
+// retry-vs-terminal decision FailRun does, with a synthetic error message.
+//
+// This is what closes the gap ClaimRuns left open: a dead worker's run
+// would otherwise sit at status='running' forever, since nothing would
+// ever call FailRun on its behalf. Nothing here is a new idea -- it's the
+// same CASE logic as FailRun, just triggered by a timeout instead of an
+// explicit report. In a running system this gets called on a timer
+// (alongside MaterializeDueRuns, once cmd/scheduler exists) rather than
+// on demand.
+func (s *Store) ReapExpiredLeases(ctx context.Context) (int, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE job_runs AS jr
+		SET
+			status           = CASE WHEN jr.attempt < j.max_attempts THEN 'pending' ELSE 'failed' END,
+			attempt          = CASE WHEN jr.attempt < j.max_attempts THEN jr.attempt + 1 ELSE jr.attempt END,
+			claimed_by       = CASE WHEN jr.attempt < j.max_attempts THEN NULL ELSE jr.claimed_by END,
+			claim_expires_at = CASE WHEN jr.attempt < j.max_attempts THEN NULL ELSE jr.claim_expires_at END,
+			started_at       = CASE WHEN jr.attempt < j.max_attempts THEN NULL ELSE jr.started_at END,
+			finished_at      = CASE WHEN jr.attempt < j.max_attempts THEN NULL ELSE now() END,
+			error            = 'lease expired: worker did not report completion'
+		FROM jobs AS j
+		WHERE jr.status = 'running' AND jr.claim_expires_at < now() AND j.id = jr.job_id`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("store: reap expired leases: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
 }
