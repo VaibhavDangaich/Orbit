@@ -319,9 +319,22 @@ go run ./cmd/worker
 
 Run a second `go run ./cmd/worker` in another terminal and watch work split across both. Run a second `go run ./cmd/scheduler` and only one will log "elected leader" — kill it and watch the other take over.
 
+## Terminal dashboard
+
+```bash
+go run ./cmd/tui
+```
+
+A single-screen, read-only view of live scheduler state — the `k9s`/`lazydocker`-style alternative to querying Postgres by hand while watching a demo run. It polls `internal/store` every 2s (`tea.Tick`, no manual refresh) and shows:
+
+- **Jobs** — id, tenant, name, schedule, enabled, and next run time (rendered relative to now, e.g. `in 5s` / `12s ago` — an overdue job is a sign the scheduler is falling behind).
+- **Run status counts** — pending/running/succeeded/failed, scoped to the most recent 500 runs by ID (`internal/store/dashboard.go`'s `RunStatusCounts`), not a time window — see that file's doc comment for why: an `ORDER BY id DESC LIMIT n` scan costs the same whether `job_runs` has a thousand rows or a hundred million, where a `created_at`-based window would have to scan every older row to rule it out.
+
+`q` or `ctrl+c` quits. Like the other two binaries, it's configured entirely by `ORBIT_*` environment variables (`ORBIT_DATABASE_URL`, defaulting to `store.DefaultDevDSN` like everything else) — no flags, no config file, and it never writes to the database: no job creation or run cancellation from here, on purpose, the same "don't build it before there's a real need" restraint behind deferring a pluggable executor.
+
 ### Configuration
 
-Both binaries are configured entirely by environment variables (no config file, no flags) — the standard pattern for anything meant to run in a container.
+All three binaries are configured entirely by environment variables (no config file, no flags) — the standard pattern for anything meant to run in a container.
 
 **`cmd/scheduler`**
 
@@ -349,12 +362,22 @@ Both binaries are configured entirely by environment variables (no config file, 
 | `ORBIT_KAFKA_BROKERS` | `localhost:19092` | Comma-separated Kafka brokers |
 | `ORBIT_KAFKA_GROUP` | `orbit-workers` | Consumer group — all workers should share this |
 
+**`cmd/tui`**
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ORBIT_DATABASE_URL` | local dev Postgres | Postgres connection string |
+| `ORBIT_TUI_REFRESH_INTERVAL` | `2s` | How often the dashboard polls the store |
+| `ORBIT_TUI_JOB_LIMIT` | `50` | Max jobs shown in the table |
+| `ORBIT_TUI_RUN_WINDOW` | `500` | How many of the most recent runs the status counts are scoped to |
+
 ## Project structure
 
 ```
 cmd/
   scheduler/     leader-elected loop: materialize due runs, reap dead leases, dispatch to Kafka
   worker/        claims + executes runs, via Kafka (primary) and a periodic sweep (safety net)
+  tui/           bubbletea dashboard: read-only, live job/run-status view (internal/store/dashboard.go)
 internal/
   job/           pure domain logic (Schedule, Job, Run) -- no database, no infra, fully unit-tested
   store/         the only package that knows Postgres exists
@@ -383,6 +406,7 @@ Stated explicitly rather than glossed over:
 - **`cmd/worker` has a per-run N+1 query** (`GetJob` after every claim, to fetch the payload) — fine at current batch sizes, a known candidate for folding into the claim query itself if it ever becomes a hot path.
 - **No pluggable executor** — `cmd/worker/execute.go` is a single function, not an `Executor` interface with a registry, because there's exactly one kind of job so far. Building the abstraction before a second kind exists would be solving a problem this system doesn't have yet.
 - **No rate limiting, no observability stack, no Kubernetes manifests yet** — all on the roadmap below.
+- **`cmd/tui` shows jobs and run counts, not who the current leader is or which worker ran what** — `internal/election` doesn't expose a read-only "who's leader" query yet, and `job_runs.claimed_by` isn't surfaced in the dashboard. Both are natural additions to `internal/store/dashboard.go`/`internal/election`, deferred because the jobs + run-status view alone already proves live visibility; adding them speculatively before there's a demo that needs them would be the same mistake this project has already avoided elsewhere.
 
 ## Roadmap
 
@@ -390,7 +414,7 @@ Stated explicitly rather than glossed over:
 - [ ] OpenTelemetry tracing + Prometheus/Grafana
 - [ ] Kubernetes deployment manifests
 - [ ] Load testing (k6) with published P50/P95/P99 numbers, plus chaos testing (kill -9 everything, prove no loss)
-- [ ] A terminal dashboard (`bubbletea`) for live job/run/leader/worker visibility
+- [x] A terminal dashboard (`bubbletea`) for live job/run/leader/worker visibility
 
 ## Testing
 
