@@ -12,22 +12,29 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/vaibhavdangaich/orbit/internal/election"
 	"github.com/vaibhavdangaich/orbit/internal/store"
 )
 
 func main() {
-	log.SetPrefix("[scheduler] ")
+	nodeID := envOr("ORBIT_NODE_ID", defaultNodeID())
+	log.SetPrefix(fmt.Sprintf("[scheduler %s] ", nodeID))
 
 	dsn := envOr("ORBIT_DATABASE_URL", store.DefaultDevDSN)
 	pollInterval := envDurationOr("ORBIT_POLL_INTERVAL", 5*time.Second)
 	batchSize := envIntOr("ORBIT_BATCH_SIZE", 50)
+	etcdEndpoints := strings.Split(envOr("ORBIT_ETCD_ENDPOINTS", "localhost:2379"), ",")
+	electionKey := envOr("ORBIT_ELECTION_KEY", "/orbit/scheduler-leader/")
+	electionTTL := envDurationOr("ORBIT_ELECTION_TTL", 10*time.Second)
 
 	// signal.NotifyContext returns a context that's cancelled the moment
 	// this process receives SIGINT (Ctrl+C) or SIGTERM (what `docker stop`
@@ -47,9 +54,76 @@ func main() {
 	}
 	defer s.Close()
 
-	log.Printf("started: poll_interval=%s batch_size=%d", pollInterval, batchSize)
-	run(ctx, s, pollInterval, batchSize)
+	elStartupCtx, elCancel := context.WithTimeout(ctx, 10*time.Second)
+	el, err := election.New(elStartupCtx, etcdEndpoints, electionKey, electionTTL)
+	elCancel()
+	if err != nil {
+		log.Fatalf("connect to etcd: %v", err)
+	}
+	defer el.Close()
+
+	log.Printf("started: poll_interval=%s batch_size=%d election_ttl=%s", pollInterval, batchSize, electionTTL)
+	runWithLeaderElection(ctx, el, nodeID, s, pollInterval, batchSize)
 	log.Printf("stopped")
+}
+
+// runWithLeaderElection blocks as a follower until this process wins the
+// leadership campaign, runs the tick loop for as long as it holds
+// leadership, and returns once the process is shutting down.
+func runWithLeaderElection(ctx context.Context, el *election.Election, nodeID string, s *store.Store, pollInterval time.Duration, batchSize int) {
+	log.Printf("campaigning for leadership")
+	if err := el.Campaign(ctx, nodeID); err != nil {
+		if ctx.Err() != nil {
+			return // shutting down while still a follower -- not an error
+		}
+		log.Fatalf("campaign: %v", err)
+	}
+	log.Printf("elected leader")
+
+	// If our own etcd session dies mid-leadership (lease expired because
+	// we lost connectivity to etcd for longer than electionTTL), cancel
+	// leaderCtx so the tick loop below stops immediately -- exactly like
+	// a SIGTERM would, just triggered by a different signal.
+	leaderCtx, cancelLeader := context.WithCancel(ctx)
+	defer cancelLeader()
+	go func() {
+		select {
+		case <-el.Done():
+			cancelLeader()
+		case <-leaderCtx.Done():
+		}
+	}()
+
+	run(leaderCtx, s, pollInterval, batchSize)
+
+	if ctx.Err() != nil {
+		// Real shutdown: resign cleanly instead of just disappearing, so
+		// the rest of the fleet doesn't have to wait out a full TTL to
+		// notice we're gone and start their own campaign.
+		resignCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := el.Resign(resignCtx); err != nil {
+			log.Printf("resign: %v", err)
+		}
+		cancel()
+		return
+	}
+
+	// leaderCtx ended but the top-level ctx didn't -- the only other
+	// trigger for that is our own session dying. We deliberately don't
+	// try to recover in-process (open a fresh session, re-campaign): a
+	// process that just discovered it silently lost its lease is in an
+	// uncertain state, and exiting lets whatever supervises it (systemd,
+	// Kubernetes) restart it cleanly rather than us reasoning our way
+	// back to a known-good state from inside the failure.
+	log.Fatalf("etcd session lost -- exiting for a clean restart")
+}
+
+func defaultNodeID() string {
+	host, err := os.Hostname()
+	if err != nil {
+		host = "unknown"
+	}
+	return fmt.Sprintf("%s-%d", host, os.Getpid())
 }
 
 // run is the actual loop, pulled out of main so it's callable without a
