@@ -157,6 +157,117 @@ services:
       - "4317:4317"   # OTLP gRPC receiver
       - "4318:4318"   # OTLP HTTP receiver
 
+  # ---------------------------------------------------------------------
+  # Schema + application. Everything above this line is infrastructure.
+  # ---------------------------------------------------------------------
+
+  # Applies migrations/*.up.sql and exits. NOT in the `app` profile -- it
+  # runs on a plain `docker compose up -d` too, because every path into
+  # this project needs the schema to exist: containerised app, host `go
+  # run`, kind pods, and `go test ./...` (store_test.go's fixture
+  # TRUNCATEs tables it assumes are already there). Before this service
+  # the README told you to pipe two .sql files through `docker exec psql`
+  # by hand, and nothing enforced that you had.
+  #
+  # golang-migrate rather than `psql -f`, because the migration files are
+  # already named for it (0001_init.up.sql) and it records applied
+  # versions in a schema_migrations table -- which is what makes `up`
+  # safe to re-run on every boot. Plain psql would re-execute CREATE
+  # TABLE and fail on the second start; these files are deliberately not
+  # written with IF NOT EXISTS, since versioned migrations aren't
+  # supposed to be.
+  #
+  # Upgrading a database created BEFORE this service existed (tables
+  # present, no schema_migrations row) needs a one-time baseline, or
+  # migrate will try to apply 0001 onto tables that already exist:
+  #   docker compose -f deploy/compose/docker-compose.yml run --rm migrate \
+  #     -path=/migrations \
+  #     -database=postgres://scheduler:scheduler@postgres:5432/scheduler?sslmode=disable \
+  #     force 2
+  # That only writes the version marker -- it touches no data. The flags
+  # have to be repeated: `compose run` replaces the service's whole
+  # command, so `run --rm migrate force 2` would drop -database with it.
+  migrate:
+    image: migrate/migrate:v4.18.1
+    volumes:
+      - ../../migrations:/migrations:ro
+    command:
+      - -path=/migrations
+      - -database=postgres://scheduler:scheduler@postgres:5432/scheduler?sslmode=disable
+      - up
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # scheduler and worker sit behind the `app` profile, so they start only
+  # with `--profile app`. A bare `docker compose up -d` keeps its existing
+  # meaning -- infrastructure only -- which is what the host `go run`
+  # workflow and the kind manifests in deploy/k8s both already assume.
+  # Starting them by default would put a second scheduler in the election
+  # the moment anyone ran `go run ./cmd/scheduler` next to it.
+  #
+  # Note the endpoints below are SERVICE NAMES on the compose network
+  # (postgres:5432, kafka:9092, redis:6379), not the host-mapped ports
+  # used everywhere else in this file (5433, 19092, 6380). A container
+  # reaching "localhost:5433" reaches itself, not the host -- the same
+  # two-hop Kafka addressing problem documented on the kafka service, seen
+  # from inside the network this time. Kafka's PLAINTEXT listener
+  # advertises localhost:19092 for host clients, but a compose-internal
+  # client connects to kafka:9092 directly and never consults that
+  # advertised address for the initial dial.
+  #
+  # No `ports:` on either service on purpose: that's what allows
+  # `--scale scheduler=2 --scale worker=3`, since a fixed host port
+  # mapping can't be shared by replicas. Prometheus reaches their
+  # /metrics over the compose network instead (see prometheus.yml), and
+  # ORBIT_NODE_ID/ORBIT_WORKER_ID are left unset so each replica falls
+  # back to hostname-pid, which is already unique per container.
+  scheduler:
+    profiles: [app]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/scheduler.Dockerfile
+    environment:
+      ORBIT_DATABASE_URL: postgres://scheduler:scheduler@postgres:5432/scheduler?sslmode=disable
+      ORBIT_ETCD_ENDPOINTS: etcd:2379
+      ORBIT_KAFKA_BROKERS: kafka:9092
+      ORBIT_OTLP_ENDPOINT: jaeger:4317
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      etcd:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    restart: unless-stopped
+
+  worker:
+    profiles: [app]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/worker.Dockerfile
+    environment:
+      ORBIT_DATABASE_URL: postgres://scheduler:scheduler@postgres:5432/scheduler?sslmode=disable
+      ORBIT_KAFKA_BROKERS: kafka:9092
+      ORBIT_REDIS_ADDR: redis:6379
+      ORBIT_OTLP_ENDPOINT: jaeger:4317
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    # restart: unless-stopped is what makes the crash-recovery demo
+    # honest -- a killed worker comes back and re-claims, rather than
+    # staying dead and making lease expiry look like the only recovery
+    # path. The scheduler gets it for the same reason on failover.
+    restart: unless-stopped
+
 volumes:
   pgdata:
   etcddata:

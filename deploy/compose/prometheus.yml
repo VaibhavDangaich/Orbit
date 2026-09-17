@@ -16,3 +16,31 @@ scrape_configs:
   - job_name: orbit-worker
     static_configs:
       - targets: ["host.docker.internal:9102"]
+
+  # The same two processes again, but as compose services rather than
+  # host processes -- `docker compose --profile app up` runs them in
+  # containers on this network, where host.docker.internal is the wrong
+  # direction entirely.
+  #
+  # dns_sd_configs, not static_configs: Docker's embedded DNS returns one
+  # A record per running replica for a service name, so this discovers
+  # all of them under `--scale scheduler=2 --scale worker=3` without
+  # naming any of them here. A static target would resolve to whichever
+  # single replica DNS happened to answer with.
+  #
+  # Both job pairs are always configured, and whichever pair isn't
+  # running simply reports no targets -- that costs a failed DNS lookup
+  # every 5s and keeps one Prometheus config correct for both the host
+  # `go run` workflow and the containerised one, instead of two configs
+  # that drift.
+  - job_name: orbit-scheduler-compose
+    dns_sd_configs:
+      - names: ["scheduler"]
+        type: A
+        port: 9101
+
+  - job_name: orbit-worker-compose
+    dns_sd_configs:
+      - names: ["worker"]
+        type: A
+        port: 9102
