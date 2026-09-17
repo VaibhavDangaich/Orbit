@@ -6,7 +6,7 @@ No AI, no CRUD, no web frontend. This is a systems project, and it's built to be
 
 ## What it actually does
 
-Define a job with a schedule (`@every 30s`) and a payload. `orbit` fires it on time, retries it if it fails, never fires it twice for the same instant, survives a crashed scheduler or a crashed worker without losing or duplicating work, and spreads execution across as many workers as you run — all coordinated through Postgres, etcd, and Kafka, with no single point of manual intervention.
+Define a job with a schedule (`@every 30s`) and a payload. `orbit` fires it on time, retries it if it fails, never fires it twice for the same instant, survives a crashed scheduler or a crashed worker without losing or duplicating work, spreads execution across as many workers as you run, and keeps one tenant's traffic from starving another's — all coordinated through Postgres, etcd, Kafka, and Redis, with no single point of manual intervention.
 
 ## Architecture
 
@@ -320,9 +320,22 @@ go run ./cmd/worker
 
 Run a second `go run ./cmd/worker` in another terminal and watch work split across both. Run a second `go run ./cmd/scheduler` and only one will log "elected leader" — kill it and watch the other take over.
 
+## Terminal dashboard
+
+```bash
+go run ./cmd/tui
+```
+
+A single-screen, read-only view of live scheduler state — the `k9s`/`lazydocker`-style alternative to querying Postgres by hand while watching a demo run. It polls `internal/store` every 2s (`tea.Tick`, no manual refresh) and shows:
+
+- **Jobs** — id, tenant, name, schedule, enabled, and next run time (rendered relative to now, e.g. `in 5s` / `12s ago` — an overdue job is a sign the scheduler is falling behind).
+- **Run status counts** — pending/running/succeeded/failed, scoped to the most recent 500 runs by ID (`internal/store/dashboard.go`'s `RunStatusCounts`), not a time window — see that file's doc comment for why: an `ORDER BY id DESC LIMIT n` scan costs the same whether `job_runs` has a thousand rows or a hundred million, where a `created_at`-based window would have to scan every older row to rule it out.
+
+`q` or `ctrl+c` quits. Like the other two binaries, it's configured entirely by `ORBIT_*` environment variables (`ORBIT_DATABASE_URL`, defaulting to `store.DefaultDevDSN` like everything else) — no flags, no config file, and it never writes to the database: no job creation or run cancellation from here, on purpose, the same "don't build it before there's a real need" restraint behind deferring a pluggable executor.
+
 ### Configuration
 
-Both binaries are configured entirely by environment variables (no config file, no flags) — the standard pattern for anything meant to run in a container.
+All three binaries are configured entirely by environment variables (no config file, no flags) — the standard pattern for anything meant to run in a container.
 
 **`cmd/scheduler`**
 
@@ -352,12 +365,22 @@ Both binaries are configured entirely by environment variables (no config file, 
 | `ORBIT_REDIS_ADDR` | `localhost:6380` | Redis address backing the per-tenant rate limiter |
 | `ORBIT_RATE_LIMIT_PER_TENANT` | `10` | Token bucket capacity and refill rate, in requests/sec, applied uniformly to every tenant |
 
+**`cmd/tui`**
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ORBIT_DATABASE_URL` | local dev Postgres | Postgres connection string |
+| `ORBIT_TUI_REFRESH_INTERVAL` | `2s` | How often the dashboard polls the store |
+| `ORBIT_TUI_JOB_LIMIT` | `50` | Max jobs shown in the table |
+| `ORBIT_TUI_RUN_WINDOW` | `500` | How many of the most recent runs the status counts are scoped to |
+
 ## Project structure
 
 ```
 cmd/
   scheduler/     leader-elected loop: materialize due runs, reap dead leases, dispatch to Kafka
   worker/        claims + executes runs, via Kafka (primary) and a periodic sweep (safety net)
+  tui/           bubbletea dashboard: read-only, live job/run-status view (internal/store/dashboard.go)
 internal/
   job/           pure domain logic (Schedule, Job, Run) -- no database, no infra, fully unit-tested
   store/         the only package that knows Postgres exists
@@ -390,6 +413,7 @@ Stated explicitly rather than glossed over:
 - **A rate-limited run waits for the sweep, not instant redelivery** — `cmd/worker` never routes a throttled run through `FailRun` (that would spend a real retry attempt on pure backpressure), so it stays `pending` and is only retried on `sweepLoop`'s interval (default 30s). A severely throttled tenant's jobs are slower to drain than a healthy tenant's, on purpose — stated here rather than left as a surprise.
 - **`sweepLoop` doesn't enforce the rate limit at all** — `ClaimRuns`' batch scan claims up to `ORBIT_BATCH_SIZE` pending runs regardless of tenant, with no call into `internal/ratelimit`. This is intentional (the sweep is what *drains* a throttled tenant's backlog; gating it too would mean a severely throttled tenant never makes progress at all) but it does mean a tenant sitting in the sweep's batch briefly runs unmetered — worth knowing before assuming the limit holds everywhere, all the time.
 - **The rate limiter fails open if Redis is unreachable** — `cmd/worker` logs it loudly and lets the run proceed as if allowed, rather than treating a Redis outage as "reject everything." The reasoning (favoring availability of the Kafka fast path over strict enforcement) is in `handleRunID`'s comment; the tradeoff is that a Redis outage means tenants are temporarily unlimited, not temporarily blocked.
+- **`cmd/tui` shows jobs and run counts, not who the current leader is or which worker ran what** — `internal/election` doesn't expose a read-only "who's leader" query yet, and `job_runs.claimed_by` isn't surfaced in the dashboard. Both are natural additions to `internal/store/dashboard.go`/`internal/election`, deferred because the jobs + run-status view alone already proves live visibility; adding them speculatively before there's a demo that needs them would be the same mistake this project has already avoided elsewhere.
 - **No observability stack, no Kubernetes manifests yet** — both on the roadmap below.
 
 ## Roadmap
@@ -398,7 +422,7 @@ Stated explicitly rather than glossed over:
 - [ ] OpenTelemetry tracing + Prometheus/Grafana
 - [ ] Kubernetes deployment manifests
 - [ ] Load testing (k6) with published P50/P95/P99 numbers, plus chaos testing (kill -9 everything, prove no loss)
-- [ ] A terminal dashboard (`bubbletea`) for live job/run/leader/worker visibility
+- [x] A terminal dashboard (`bubbletea`) for live job/run/leader/worker visibility
 
 ## Testing
 
@@ -408,4 +432,4 @@ go test ./... -race
 
 Every package with infrastructure dependencies (`internal/store`, `internal/queue`, `internal/ratelimit`) skips cleanly with a clear message if Postgres/Kafka/Redis isn't running, rather than failing opaquely. `internal/job` and `internal/hashring` are pure logic and need nothing running at all.
 
-Correctness claims in this README aren't just asserted — the ones involving real concurrency or real infrastructure (fencing, leader failover, partition stickiness, zero-duplication under retries) were verified against live Postgres, etcd, and Kafka, not just unit-tested in isolation.
+Correctness claims in this README aren't just asserted — the ones involving real concurrency or real infrastructure (fencing, leader failover, partition stickiness, zero-duplication under retries, rate limiting without spending retries) were verified against live Postgres, etcd, Kafka, and Redis, not just unit-tested in isolation.
