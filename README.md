@@ -1,5 +1,7 @@
 # orbit
 
+[![ci](https://github.com/VaibhavDangaich/Orbit/actions/workflows/ci.yml/badge.svg)](https://github.com/VaibhavDangaich/Orbit/actions/workflows/ci.yml)
+
 A distributed job scheduler — the same class of problem Kubernetes' CronJob controller, Temporal, and Airflow solve — built from scratch in Go to demonstrate the mechanics most portfolio projects wave their hands at: leader election, exactly-the-right-amount-of-execution under crashes, safe concurrent claiming with zero external coordination, and message-queue migration done correctly.
 
 No AI, no CRUD, no web frontend. This is a systems project, and it's built to be defended in an interview, not just demoed.
@@ -301,27 +303,42 @@ Zero mixing across dozens of firings — every job-A run went to worker 3, every
 
 ## Getting started
 
-Requires Docker and Go 1.26+.
+### Run the whole system — Docker only, no Go toolchain
 
 ```bash
-# 1. Start Postgres, etcd, Kafka, Redis, Prometheus, Grafana, and Jaeger
-docker compose -f deploy/compose/docker-compose.yml up -d
+# Infrastructure, schema migrations, 2 schedulers and 3 workers, in one command
+docker compose -f deploy/compose/docker-compose.yml --profile app up -d --build \
+  --scale scheduler=2 --scale worker=3
 
-# 2. Apply the schema
-docker exec -i compose-postgres-1 psql -U scheduler -d scheduler < migrations/0001_init.up.sql
-docker exec -i compose-postgres-1 psql -U scheduler -d scheduler < migrations/0002_outbox.up.sql
-
-# 3. Seed a job (there's no API yet -- see Roadmap)
+# Seed a job (there's no API yet -- see Roadmap)
 docker exec -i compose-postgres-1 psql -U scheduler -d scheduler -c \
   "INSERT INTO jobs (tenant_id, name, schedule, payload, enabled, max_attempts, next_run_at) \
    VALUES ('demo', 'hello', '@every 10s', '{\"message\":\"hello from orbit\"}', true, 3, now());"
 
-# 4. Run the scheduler and one or more workers, in separate terminals
+# Watch it work
+docker compose -f deploy/compose/docker-compose.yml logs -f scheduler worker
+```
+
+`scheduler=2` is the interesting part: both containers start, exactly one wins the etcd election, and the other waits as a hot standby. `docker kill` the leader and the standby takes over — see [Watch it fail over](#watch-it-fail-over) below.
+
+Schema creation is not a step here. A `migrate` service (golang-migrate) applies `migrations/*.up.sql` before the app starts and records the applied version, so it re-runs safely on every boot. It runs on a plain `up -d` too, since the host workflow below and the test suite need those tables just as much.
+
+> Upgrading a database created before that service existed? It has tables but no `schema_migrations` row, so baseline it once — the exact command is commented in `deploy/compose/docker-compose.yml` above the `migrate` service. It writes only the version marker and touches no data.
+
+### Develop on it — Go 1.26+
+
+The app services sit behind a `--profile app` gate, so a bare `up -d` starts infrastructure and migrations only, leaving the binaries to you:
+
+```bash
+docker compose -f deploy/compose/docker-compose.yml up -d
+
 go run ./cmd/scheduler
 go run ./cmd/worker
 ```
 
 Run a second `go run ./cmd/worker` in another terminal and watch work split across both. Run a second `go run ./cmd/scheduler` and only one will log "elected leader" — kill it and watch the other take over.
+
+Don't mix the two: an `app`-profile scheduler and a `go run` scheduler will both join the same election, which is legal but makes it much harder to tell which process you're actually watching.
 
 ## Terminal dashboard
 
@@ -494,5 +511,9 @@ go test ./... -race
 ```
 
 Every package with infrastructure dependencies (`internal/store`, `internal/queue`, `internal/ratelimit`) skips cleanly with a clear message if Postgres/Kafka/Redis isn't running, rather than failing opaquely. `internal/job` and `internal/hashring` are pure logic and need nothing running at all.
+
+That skip-don't-fail behaviour is convenient locally and dangerous in CI: a pipeline without those services would report green while testing almost nothing. So [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs Postgres, Redis and Kafka as real service containers, on the same host ports `deploy/compose` uses — which lets `store.DefaultDevDSN`, `ratelimit.DefaultDevAddr` and `queue.DefaultDevBrokers` resolve unmodified, so a drifting default breaks the build instead of quietly skipping past it. A preflight step dials all three ports before `go test` runs, turning "the services never came up" from an invisible skip into a failed job. Tests run under `-race`, and both container images are built in a parallel job.
+
+Nothing is mocked in CI. The same fencing, election and partition-assignment code paths that back the claims above run against real Postgres, real Kafka and real Redis on every push.
 
 Correctness claims in this README aren't just asserted — the ones involving real concurrency or real infrastructure (fencing, leader failover, partition stickiness, zero-duplication under retries, rate limiting without spending retries) were verified against live Postgres, etcd, Kafka, and Redis, not just unit-tested in isolation.
