@@ -6,7 +6,10 @@ services:
       POSTGRES_PASSWORD: scheduler
       POSTGRES_DB: scheduler
     ports:
-      - "5432:5432"
+      # Host 5433, not 5432: a machine-local Postgres install may already
+      # own 5432 on localhost, and Docker's proxy can silently lose that
+      # race depending on which process bound the loopback address first.
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
