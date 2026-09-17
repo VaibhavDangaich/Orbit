@@ -340,6 +340,48 @@ Run a second `go run ./cmd/worker` in another terminal and watch work split acro
 
 Don't mix the two: an `app`-profile scheduler and a `go run` scheduler will both join the same election, which is legal but makes it much harder to tell which process you're actually watching.
 
+## Watch it fail over
+
+The single most load-bearing claim in this README is that killing the active scheduler doesn't stop jobs from firing. Here's how to make that happen on your own machine in about a minute — and, more usefully, how to see that **the two ways of killing it behave differently**, which is where the interesting engineering actually is.
+
+Start two schedulers and find the leader:
+
+```bash
+docker compose -f deploy/compose/docker-compose.yml --profile app up -d --build \
+  --scale scheduler=2 --scale worker=3
+
+docker compose -f deploy/compose/docker-compose.yml logs scheduler | grep -E "campaigning|elected leader"
+```
+
+Exactly one container logs `elected leader`. The other stays on `campaigning for leadership` — a hot standby, already connected to etcd, Postgres and Kafka, blocked inside `Campaign` waiting for the key to free up.
+
+**Graceful — `docker stop` (SIGTERM):**
+
+```bash
+docker stop compose-scheduler-1   # whichever one logged "elected leader"
+```
+
+The process catches SIGTERM, stops its tick loop, and calls `Resign()` before exiting. Resigning deletes the election key immediately, so the standby's blocked `Campaign` returns **in milliseconds**. You will struggle to catch a gap.
+
+**Crash — `docker kill` (SIGKILL):**
+
+```bash
+docker kill compose-scheduler-1
+```
+
+SIGKILL cannot be caught, so nothing resigns. The election key survives, still held by a process that no longer exists, until its etcd lease expires — which takes up to `ORBIT_ELECTION_TTL` (10s by default). Only then does the standby get promoted.
+
+That gap is not a bug to be tuned away; it's the price of detecting a death nobody announced, and it's the same trade every lease-based system makes. Lower the TTL and failover is faster but a brief etcd hiccup can evict a healthy leader; raise it and you survive network blips at the cost of a longer silent window.
+
+| | signal | resign? | time to next leader |
+|---|---|---|---|
+| `docker stop` | SIGTERM | yes, explicit `Resign()` | milliseconds |
+| `docker kill` | SIGKILL | no — process is simply gone | up to `ORBIT_ELECTION_TTL` (10s) |
+
+Both services run with `restart: unless-stopped`, so the killed container comes back and rejoins as the new standby — the roles simply swap. (`docker stop` is a manual stop, so that one stays down until you start it again.)
+
+Jobs keep firing across both cases. Nothing is lost in the crash case either: `next_run_at` lives in Postgres, not in the dead scheduler's memory, so the incoming leader materialises whatever came due during the gap on its first tick.
+
 ## Terminal dashboard
 
 ```bash
