@@ -20,6 +20,7 @@ type model struct {
 	table  table.Model
 	counts store.RunStatusCounts
 	err    error
+	width  int // last known terminal width, for the divider and column layout
 
 	refreshInterval time.Duration
 	jobLimit        int
@@ -40,8 +41,12 @@ type dataMsg struct {
 type tickMsg time.Time
 
 func newModel(s *store.Store, refreshInterval time.Duration, jobLimit, runWindow int) model {
+	// 80 is just a starting point -- bubbletea always sends a real
+	// tea.WindowSizeMsg immediately on startup, which recomputes this
+	// against the terminal's actual width before the first frame the
+	// user sees.
 	t := table.New(
-		table.WithColumns(jobColumns()),
+		table.WithColumns(computeJobColumns(80)),
 		table.WithFocused(true),
 	)
 	t.SetStyles(tableStyles())
@@ -49,12 +54,18 @@ func newModel(s *store.Store, refreshInterval time.Duration, jobLimit, runWindow
 	return model{
 		s:               s,
 		table:           t,
+		width:           80,
 		refreshInterval: refreshInterval,
 		jobLimit:        jobLimit,
 		runWindow:       runWindow,
 	}
 }
 
+// tableStyles keeps the table calm relative to the banner: header text is
+// muted, not accent-colored, so the banner remains the single brightest
+// element on screen. The selected row gets a subtle background tint plus
+// accent-colored text -- a functional indicator, not a solid color block
+// filling the whole row.
 func tableStyles() table.Styles {
 	s := table.DefaultStyles()
 	s.Header = s.Header.
@@ -62,11 +73,11 @@ func tableStyles() table.Styles {
 		BorderForeground(colorMuted).
 		BorderBottom(true).
 		Bold(true).
-		Foreground(colorAccent)
+		Foreground(colorMuted)
 	s.Selected = s.Selected.
-		Foreground(lipgloss.Color("0")).
-		Background(colorAccent).
-		Bold(false)
+		Foreground(colorAccent).
+		Background(lipgloss.Color("236")).
+		Bold(true)
 	return s
 }
 
@@ -106,13 +117,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.WindowSizeMsg:
+		m.width = msg.Width
 		m.table.SetWidth(msg.Width)
-		// Leave room for the banner (5 lines), the tagline, the count
-		// boxes (4 rows + caption), and the help line, plus blank
-		// spacers between sections -- a fixed budget rather than a
-		// perfectly reactive layout, which is plenty for a single-screen
-		// dashboard. See View() for the exact section list this counts.
-		h := msg.Height - 15
+		m.table.SetColumns(computeJobColumns(msg.Width))
+		// Leave room for the banner (5 lines), the tagline, the divider,
+		// the stats block (header + labels + numbers), and the help
+		// line, plus blank spacers between sections -- a fixed budget
+		// rather than a perfectly reactive layout, which is plenty for a
+		// single-screen dashboard. See View() for the exact section list
+		// this counts.
+		h := msg.Height - 16
 		if h < 3 {
 			h = 3
 		}
@@ -138,10 +152,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	banner := renderBanner()
 	tagline := taglineStyle.Render("distributed job scheduler")
+	divider := renderDivider(m.width)
 	counts := renderCounts(m.counts, m.runWindow)
 	help := helpStyle.Render("q / ctrl+c: quit  •  ↑/↓: scroll jobs  •  refreshes every " + m.refreshInterval.String())
 
-	sections := []string{banner, tagline, "", counts, "", m.table.View(), "", help}
+	sections := []string{banner, tagline, "", divider, "", counts, "", m.table.View(), "", help}
 	if m.err != nil {
 		sections = append(sections, "", errStyle.Render("error refreshing: "+m.err.Error()))
 	}

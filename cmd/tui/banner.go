@@ -24,12 +24,14 @@ var bannerLines = []string{
 	`\____/_/ |_/_____/___/ /_/     `,
 }
 
-// bannerStyle renders the whole banner in one flat, bold accent color --
-// no gradient. A per-line color gradient looked showy rather than clean;
-// one solid color also ties the banner visually to the rest of the
-// dashboard, which already uses colorAccent for the RUNNING status box and
-// the table header.
-var bannerStyle = lipgloss.NewStyle().Bold(true).Foreground(colorAccent)
+// bannerStyle renders the banner in plain bold white -- not the accent
+// color. Establishing a clear hierarchy is the point: the banner is the
+// single largest, boldest thing on screen, so it doesn't also need to be
+// the one colored thing to draw the eye. colorAccent is reserved entirely
+// for renderDivider and the table's selected-row highlight -- exactly two
+// places, both functional (a real dividing line, a real selection
+// indicator), not decoration layered onto the logo.
+var bannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("255"))
 
 func renderBanner() string {
 	return bannerStyle.Render(strings.Join(bannerLines, "\n"))
