@@ -407,6 +407,15 @@ func (s *Store) ClaimRun(ctx context.Context, runID job.RunID, workerID string, 
 // interface would say the same thing with more ceremony; Go's http.
 // HandlerFunc is the standard-library example of this same idiom.
 //
+// jobID comes along via a JOIN to job_runs rather than being denormalized
+// onto outbox itself -- outbox.run_id already has a foreign key into
+// job_runs, so the join is always consistent, and this query runs on a
+// poll interval against small batches, not a latency-critical request
+// path, so there's no real cost to reading job_id this way instead of
+// duplicating it. publish uses jobID to pick a Kafka partition (see
+// queue.HashBalancer) so a job's runs consistently land on the same
+// partition over time.
+//
 // If publish fails partway through a batch, the whole transaction rolls
 // back -- including the dispatched_at marks already written for earlier
 // rows in this same batch. Those get republished on the next call. That's
@@ -414,20 +423,26 @@ func (s *Store) ClaimRun(ctx context.Context, runID job.RunID, workerID string, 
 // least once," and ClaimRun's fencing (WHERE status = 'pending') is what
 // makes a duplicate harmless downstream. See migrations/0002_outbox.up.sql
 // for the fuller version of this argument.
-func (s *Store) DispatchOutbox(ctx context.Context, limit int, publish func(context.Context, job.RunID) error) (int, error) {
+func (s *Store) DispatchOutbox(ctx context.Context, limit int, publish func(context.Context, job.RunID, job.ID) error) (int, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("store: dispatch outbox: begin: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
+	// FOR UPDATE OF o -- not a bare FOR UPDATE -- locks only the outbox
+	// rows this transaction is about to mark dispatched, not the joined
+	// job_runs rows too. We only ever READ job_id here; locking job_runs
+	// as well would needlessly serialize against ClaimRun's concurrent
+	// UPDATEs on those same rows for no benefit.
 	rows, err := tx.Query(ctx, `
-		SELECT id, run_id
-		FROM outbox
-		WHERE dispatched_at IS NULL
-		ORDER BY id
+		SELECT o.id, o.run_id, jr.job_id
+		FROM outbox o
+		JOIN job_runs jr ON jr.id = o.run_id
+		WHERE o.dispatched_at IS NULL
+		ORDER BY o.id
 		LIMIT $1
-		FOR UPDATE SKIP LOCKED`,
+		FOR UPDATE OF o SKIP LOCKED`,
 		limit,
 	)
 	if err != nil {
@@ -437,11 +452,12 @@ func (s *Store) DispatchOutbox(ctx context.Context, limit int, publish func(cont
 	type outboxRow struct {
 		id    int64
 		runID job.RunID
+		jobID job.ID
 	}
 	var pending []outboxRow
 	for rows.Next() {
 		var r outboxRow
-		if err := rows.Scan(&r.id, &r.runID); err != nil {
+		if err := rows.Scan(&r.id, &r.runID, &r.jobID); err != nil {
 			rows.Close()
 			return 0, fmt.Errorf("store: dispatch outbox: scan: %w", err)
 		}
@@ -454,7 +470,7 @@ func (s *Store) DispatchOutbox(ctx context.Context, limit int, publish func(cont
 
 	dispatched := 0
 	for _, r := range pending {
-		if err := publish(ctx, r.runID); err != nil {
+		if err := publish(ctx, r.runID, r.jobID); err != nil {
 			return dispatched, fmt.Errorf("store: dispatch outbox: publish run %d: %w", r.runID, err)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE outbox SET dispatched_at = now() WHERE id = $1`, r.id); err != nil {

@@ -392,7 +392,7 @@ func TestFailRunRetryWritesOutboxEntry(t *testing.T) {
 	// still-undispatched materialize row, plus a new one from the retry --
 	// which is a real, accepted possibility in production (a harmless
 	// duplicate publish later), just not what this test is isolating.
-	if _, err := s.DispatchOutbox(ctx, 10, func(context.Context, job.RunID) error { return nil }); err != nil {
+	if _, err := s.DispatchOutbox(ctx, 10, func(context.Context, job.RunID, job.ID) error { return nil }); err != nil {
 		t.Fatalf("DispatchOutbox: %v", err)
 	}
 
@@ -426,7 +426,7 @@ func TestReapExpiredLeasesRetryWritesOutboxEntry(t *testing.T) {
 	}
 	// Consume the materialize-time outbox row first -- see the comment in
 	// TestFailRunRetryWritesOutboxEntry for why.
-	if _, err := s.DispatchOutbox(ctx, 10, func(context.Context, job.RunID) error { return nil }); err != nil {
+	if _, err := s.DispatchOutbox(ctx, 10, func(context.Context, job.RunID, job.ID) error { return nil }); err != nil {
 		t.Fatalf("DispatchOutbox: %v", err)
 	}
 
@@ -493,14 +493,16 @@ func TestDispatchOutbox(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Microsecond)
 
-	mustCreateJob(t, s, now)
+	j := mustCreateJob(t, s, now)
 	if _, err := s.MaterializeDueRuns(ctx, now, 10); err != nil {
 		t.Fatalf("MaterializeDueRuns: %v", err)
 	}
 
 	var published []job.RunID
-	dispatched, err := s.DispatchOutbox(ctx, 10, func(_ context.Context, runID job.RunID) error {
+	var publishedJobIDs []job.ID
+	dispatched, err := s.DispatchOutbox(ctx, 10, func(_ context.Context, runID job.RunID, jobID job.ID) error {
 		published = append(published, runID)
+		publishedJobIDs = append(publishedJobIDs, jobID)
 		return nil
 	})
 	if err != nil {
@@ -508,6 +510,12 @@ func TestDispatchOutbox(t *testing.T) {
 	}
 	if dispatched != 1 || len(published) != 1 {
 		t.Fatalf("dispatched = %d, published = %v, want 1 and one call", dispatched, published)
+	}
+	// The whole point of threading jobID through: the publish callback
+	// must see the ACTUAL parent job's ID (via the outbox->job_runs join),
+	// not a zero value or the run's own ID.
+	if publishedJobIDs[0] != j.ID {
+		t.Fatalf("published jobID = %d, want %d", publishedJobIDs[0], j.ID)
 	}
 
 	// Already-dispatched rows must not be handed out again.
@@ -532,7 +540,7 @@ func TestDispatchOutboxLeavesRowUndispatchedOnPublishError(t *testing.T) {
 		t.Fatalf("undispatched outbox rows before = %v, want 1", before)
 	}
 
-	_, err := s.DispatchOutbox(ctx, 10, func(_ context.Context, _ job.RunID) error {
+	_, err := s.DispatchOutbox(ctx, 10, func(_ context.Context, _ job.RunID, _ job.ID) error {
 		return fmt.Errorf("broker unreachable")
 	})
 	if err == nil {

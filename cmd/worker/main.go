@@ -57,7 +57,7 @@ func main() {
 	}
 	defer s.Close()
 
-	consumer := queue.NewConsumer(kafkaBrokers, kafkaGroup)
+	consumer := queue.NewConsumer(kafkaBrokers, kafkaGroup, queue.RunsTopic)
 	defer consumer.Close()
 
 	log.Printf("started: lease=%s sweep_interval=%s kafka_group=%s", lease, sweepInterval, kafkaGroup)

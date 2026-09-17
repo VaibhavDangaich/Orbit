@@ -73,13 +73,13 @@ func main() {
 	// workers are running -- Kafka partitions, not consumer count, are
 	// the unit of parallelism.
 	topicCtx, topicCancel := context.WithTimeout(ctx, 10*time.Second)
-	err = queue.EnsureTopic(topicCtx, kafkaBrokers, kafkaPartitions)
+	err = queue.EnsureTopic(topicCtx, kafkaBrokers, queue.RunsTopic, kafkaPartitions)
 	topicCancel()
 	if err != nil {
 		log.Fatalf("ensure kafka topic: %v", err)
 	}
 
-	publisher := queue.NewPublisher(kafkaBrokers)
+	publisher := queue.NewPublisher(kafkaBrokers, queue.RunsTopic)
 	defer publisher.Close()
 
 	log.Printf("started: poll_interval=%s batch_size=%d election_ttl=%s kafka_partitions=%d", pollInterval, batchSize, electionTTL, kafkaPartitions)

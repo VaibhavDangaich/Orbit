@@ -34,11 +34,11 @@ type runMessage struct {
 	RunID job.RunID `json:"run_id"`
 }
 
-// EnsureTopic creates RunsTopic with the given partition count if it
-// doesn't already exist. Idempotent: creating a topic that already exists
-// is treated as success, not an error, so this is safe to call on every
+// EnsureTopic creates topic with the given partition count if it doesn't
+// already exist. Idempotent: creating a topic that already exists is
+// treated as success, not an error, so this is safe to call on every
 // startup rather than requiring a separate manual setup step.
-func EnsureTopic(ctx context.Context, brokers []string, partitions int) error {
+func EnsureTopic(ctx context.Context, brokers []string, topic string, partitions int) error {
 	conn, err := kafka.DialContext(ctx, "tcp", brokers[0])
 	if err != nil {
 		return fmt.Errorf("queue: dial: %w", err)
@@ -56,7 +56,7 @@ func EnsureTopic(ctx context.Context, brokers []string, partitions int) error {
 	defer controllerConn.Close()
 
 	err = controllerConn.CreateTopics(kafka.TopicConfig{
-		Topic:             RunsTopic,
+		Topic:             topic,
 		NumPartitions:     partitions,
 		ReplicationFactor: 1,
 	})
@@ -71,16 +71,20 @@ type Publisher struct {
 	writer *kafka.Writer
 }
 
-func NewPublisher(brokers []string) *Publisher {
+func NewPublisher(brokers []string, topic string) *Publisher {
 	return &Publisher{
 		writer: &kafka.Writer{
 			Addr:  kafka.TCP(brokers...),
-			Topic: RunsTopic,
-			// LeastBytes spreads messages across partitions by current
-			// queue size rather than hashing the key -- fine here since
-			// we don't need same-job-same-partition ordering (Postgres,
-			// not partition order, is what enforces run-level invariants).
-			Balancer: &kafka.LeastBytes{},
+			Topic: topic,
+			// HashBalancer, not LeastBytes: Publish keys each message by
+			// JobID, so every run belonging to the same job consistently
+			// lands on the same partition (and, in the steady state, the
+			// same worker) instead of scattering across whichever
+			// partition looked least busy at that instant. Postgres
+			// fencing is still what makes cross-partition/cross-worker
+			// claims safe either way -- this is about locality and
+			// minimal remapping on repartitioning, not correctness.
+			Balancer: NewHashBalancer(),
 			// Bounds how long a single publish can block. This matters
 			// beyond the obvious "don't hang forever": DispatchOutbox
 			// calls Publish while holding a Postgres transaction open
@@ -92,13 +96,13 @@ func NewPublisher(brokers []string) *Publisher {
 	}
 }
 
-func (p *Publisher) Publish(ctx context.Context, runID job.RunID) error {
+func (p *Publisher) Publish(ctx context.Context, runID job.RunID, jobID job.ID) error {
 	body, err := json.Marshal(runMessage{RunID: runID})
 	if err != nil {
 		return fmt.Errorf("queue: marshal run %d: %w", runID, err)
 	}
 	return p.writer.WriteMessages(ctx, kafka.Message{
-		Key:   fmt.Appendf(nil, "%d", runID),
+		Key:   fmt.Appendf(nil, "%d", jobID),
 		Value: body,
 	})
 }
@@ -119,12 +123,12 @@ type Consumer struct {
 	reader *kafka.Reader
 }
 
-func NewConsumer(brokers []string, groupID string) *Consumer {
+func NewConsumer(brokers []string, groupID, topic string) *Consumer {
 	return &Consumer{
 		reader: kafka.NewReader(kafka.ReaderConfig{
 			Brokers: brokers,
 			GroupID: groupID,
-			Topic:   RunsTopic,
+			Topic:   topic,
 		}),
 	}
 }
