@@ -472,7 +472,9 @@ A single-screen, read-only view of live scheduler state — the `k9s`/`lazydocke
 
 ## Observability
 
-`cmd/scheduler` and `cmd/worker` each expose a Prometheus `/metrics` endpoint (`internal/metrics`, the only package that imports `prometheus/client_golang` — same containment principle as store/election/queue/ratelimit for their infra dependencies). `deploy/compose` runs Prometheus (scraping both, via `host.docker.internal` since the binaries run on the host, not in a container) and Grafana, with Prometheus auto-provisioned as Grafana's datasource — no manual "add data source" click-through.
+`cmd/scheduler` and `cmd/worker` each expose a Prometheus `/metrics` endpoint (`internal/metrics`, the only package that imports `prometheus/client_golang` — same containment principle as store/election/queue/ratelimit for their infra dependencies). `deploy/compose` runs Prometheus and Grafana, with Prometheus auto-provisioned as Grafana's datasource — no manual "add data source" click-through.
+
+Prometheus scrapes both binaries wherever they happen to be running: host processes via `host.docker.internal`, and `--profile app` containers via Docker's DNS, which returns one A record per replica. That second path uses `dns_sd_configs` rather than a static target so that `--scale worker=3` is picked up without naming replicas in the scrape config. Both sets of jobs are configured permanently and whichever isn't running simply reports no targets.
 
 ```bash
 open http://localhost:9090   # Prometheus — raw queries, scrape target health
