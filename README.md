@@ -205,6 +205,7 @@ Every one of these is implemented and covered by a test that proves the property
 | **Reconciliation as a safety net, not a religion** | `cmd/worker` (`sweepLoop`) | If the outbox/Kafka path is ever down, the original batch-poll claim path still finds the work |
 | **Per-tenant rate limiting without spending retries** | `internal/ratelimit` (Lua-scripted token bucket in Redis), `cmd/worker` (`handleRunID`) | An `EVAL`-atomic token bucket, checked before `ClaimRun` -- proven not to over-admit under concurrency in `TestAllowNoOverAdmitConcurrent`, the same "race for one slot" proof shape as `TestClaimRunsNoDoubleClaim`. A throttled run is deferred to `sweepLoop`, not routed through `FailRun`, so backpressure never spends one of the run's real `MaxAttempts` |
 | **Metrics as a cross-cutting exception to strict containment** | `internal/metrics` | Verified live: real Prometheus scrape of both binaries via `host.docker.internal`, real Grafana query through its own provisioned datasource proxy -- `orbit_runs_claimed_total{path="sweep"}` and `orbit_runs_completed_total{status="succeeded"}` both landed on the exact count of runs actually observed executing, not just a metric that compiles |
+| **Distributed tracing across an async boundary** | `internal/tracing`, `internal/queue/tracing.go` (`kafkaHeaderCarrier`) | HTTP has a standard header slot for trace context and middleware that injects/extracts it automatically; Kafka has neither. `kafkaHeaderCarrier` bridges OpenTelemetry's `propagation.TextMapCarrier` interface to `kafka.Header` slices, so a span started in `cmd/scheduler` survives sitting in a topic and resumes as the parent of a span started in a completely different `cmd/worker` process -- verified live via Jaeger's API: producer (`orbit.runs publish`) and consumer (`orbit.runs consume`) spans share one trace ID with correct parent-child linkage, and `claim_run`/`execute` spans nest correctly underneath |
 
 ## Proven under real failure, not just designed for it
 
@@ -302,7 +303,7 @@ Zero mixing across dozens of firings — every job-A run went to worker 3, every
 Requires Docker and Go 1.26+.
 
 ```bash
-# 1. Start Postgres, etcd, Kafka, Redis, Prometheus, and Grafana
+# 1. Start Postgres, etcd, Kafka, Redis, Prometheus, Grafana, and Jaeger
 docker compose -f deploy/compose/docker-compose.yml up -d
 
 # 2. Apply the schema
@@ -356,7 +357,15 @@ open http://localhost:3001   # Grafana — Prometheus pre-wired as the default d
 
 **Verified live, not just wired up**: ran the real scheduler + worker against real Prometheus and Grafana, and every one of the numbers above came back correct and internally consistent — `orbit_runs_materialized_total` and `orbit_runs_dispatched_total` matched exactly, `orbit_runs_claimed_total{path="sweep"}` and `orbit_runs_completed_total{status="succeeded"}` both landed on the same count as the runs actually observed executing in the logs, and `orbit_run_execution_duration_seconds_count` was nonzero on the worker and correctly zero on the scheduler (execution only happens in one of them). That specific run happened to be claimed entirely by the reconciliation sweep rather than the Kafka path (a Kafka consumer-group join took longer than the sweep's next tick) — not a failure, exactly the scenario the sweep exists for, and now it's a real number instead of just a design claim. Queried Prometheus directly and through Grafana's own datasource proxy to confirm both paths return identical live data.
 
-Distributed tracing (OpenTelemetry, following one run's actual path across the scheduler → Kafka → worker boundary) is deliberately a separate, later phase — see Roadmap.
+### Tracing
+
+`internal/tracing` installs an OpenTelemetry `TracerProvider` in both binaries at startup, exporting to Jaeger over OTLP/gRPC (`deploy/compose` runs `jaegertracing/all-in-one`, which accepts OTLP natively). `cmd/scheduler` starts a **producer** span in `internal/queue.Publisher.Publish` and injects it into the Kafka message's headers; `cmd/worker` extracts it back out in `Consumer.Next`, starting a **consumer** span as its child, with `claim_run` and `execute` spans nested one level deeper. HTTP has a standard header slot and middleware for this; Kafka has neither, so `internal/queue/tracing.go`'s `kafkaHeaderCarrier` is the actual mechanism that lets a span survive sitting in a topic and resume in a different process.
+
+```bash
+open http://localhost:16686   # Jaeger UI — search by service (orbit-scheduler / orbit-worker) or trace ID
+```
+
+**Verified live, not just wired up**: ran the real scheduler + worker, seeded a job, and queried Jaeger's HTTP API directly for the resulting trace. `orbit.runs publish` (service `orbit-scheduler`, root span) and `orbit.runs consume` (service `orbit-worker`) shared one trace ID with a correct `CHILD_OF` reference, and `orbit.worker claim_run` / `orbit.worker execute` nested correctly underneath the consumer span — a real cross-process, cross-Kafka-boundary trace, not two spans that merely look related. One honest gap found in the process: this project's shared dev Kafka topic (`orbit.runs`) has accumulated backlog across many months of manual testing (topics are durable; nothing here purges them), and a couple of those old messages happened to reuse a run ID from the fresh test run after an unrelated Postgres reset earlier in development — those pre-tracing messages correctly show up in Jaeger as standalone root spans (no crash, no corruption, just no parent to link to, exactly as W3C Trace Context propagation should behave for a message with no `traceparent` header). Not a tracing bug; a reminder that a long-lived dev topic needs occasional cleanup, same lesson `internal/queue`'s own tests already learned (see `queue_test.go`'s per-test disposable topic).
 
 ### Configuration
 
@@ -376,6 +385,7 @@ All three binaries are configured entirely by environment variables (no config f
 | `ORBIT_KAFKA_BROKERS` | `localhost:19092` | Comma-separated Kafka brokers |
 | `ORBIT_KAFKA_PARTITIONS` | `3` | Partition count for topic creation |
 | `ORBIT_METRICS_ADDR` | `:9101` | Address the Prometheus `/metrics` endpoint binds to |
+| `ORBIT_OTLP_ENDPOINT` | `localhost:4317` | Jaeger's OTLP/gRPC receiver address |
 
 **`cmd/worker`**
 
@@ -391,6 +401,7 @@ All three binaries are configured entirely by environment variables (no config f
 | `ORBIT_REDIS_ADDR` | `localhost:6380` | Redis address backing the per-tenant rate limiter |
 | `ORBIT_RATE_LIMIT_PER_TENANT` | `10` | Token bucket capacity and refill rate, in requests/sec, applied uniformly to every tenant |
 | `ORBIT_METRICS_ADDR` | `:9102` | Address the Prometheus `/metrics` endpoint binds to -- different default from `cmd/scheduler` so running one of each locally doesn't collide |
+| `ORBIT_OTLP_ENDPOINT` | `localhost:4317` | Jaeger's OTLP/gRPC receiver address |
 
 **`cmd/tui`**
 
@@ -442,13 +453,14 @@ Stated explicitly rather than glossed over:
 - **`sweepLoop` doesn't enforce the rate limit at all** — `ClaimRuns`' batch scan claims up to `ORBIT_BATCH_SIZE` pending runs regardless of tenant, with no call into `internal/ratelimit`. This is intentional (the sweep is what *drains* a throttled tenant's backlog; gating it too would mean a severely throttled tenant never makes progress at all) but it does mean a tenant sitting in the sweep's batch briefly runs unmetered — worth knowing before assuming the limit holds everywhere, all the time.
 - **The rate limiter fails open if Redis is unreachable** — `cmd/worker` logs it loudly and lets the run proceed as if allowed, rather than treating a Redis outage as "reject everything." The reasoning (favoring availability of the Kafka fast path over strict enforcement) is in `handleRunID`'s comment; the tradeoff is that a Redis outage means tenants are temporarily unlimited, not temporarily blocked.
 - **`cmd/tui` shows jobs and run counts, not who the current leader is or which worker ran what** — `internal/election` doesn't expose a read-only "who's leader" query yet, and `job_runs.claimed_by` isn't surfaced in the dashboard. Both are natural additions to `internal/store/dashboard.go`/`internal/election`, deferred because the jobs + run-status view alone already proves live visibility; adding them speculatively before there's a demo that needs them would be the same mistake this project has already avoided elsewhere.
-- **No observability stack, no Kubernetes manifests yet** — both on the roadmap below.
+- **No Kubernetes manifests yet** — on the roadmap below.
+- **The dev Kafka topic (`orbit.runs`) is durable and never purged** — months of manual local testing leave backlog behind, and after a Postgres reset that backlog can reference run IDs that no longer exist (harmless: `GetRunTenant` returns `not found` and the message is skipped). This is exactly why `internal/queue`'s own tests give themselves a disposable per-test topic instead of using the shared one — the production code intentionally doesn't do this (the topic is meant to be long-lived), so periodic manual cleanup (`docker compose down -v` or deleting/recreating the topic) is the accepted tradeoff for a local dev environment, not something worth automating for a single-node demo.
 
 ## Roadmap
 
 - [x] Redis-backed per-tenant rate limiting
 - [x] Prometheus metrics + Grafana (see "Observability" below)
-- [ ] OpenTelemetry distributed tracing across the scheduler → Kafka → worker boundary
+- [x] OpenTelemetry distributed tracing across the scheduler → Kafka → worker boundary (see "Observability")
 - [ ] Kubernetes deployment manifests
 - [ ] Load testing (k6) with published P50/P95/P99 numbers, plus chaos testing (kill -9 everything, prove no loss)
 - [x] A terminal dashboard (`bubbletea`) for live job/run/leader/worker visibility

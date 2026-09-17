@@ -16,6 +16,12 @@ import (
 
 	"github.com/segmentio/kafka-go"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/vaibhavdangaich/orbit/internal/job"
 )
 
@@ -96,15 +102,44 @@ func NewPublisher(brokers []string, topic string) *Publisher {
 	}
 }
 
+// Publish starts the PRODUCER span for this run's trace -- the root of
+// whatever this message's trace ends up looking like once it's stitched
+// together with the consumer span on the other side. See
+// kafkaHeaderCarrier for how the two ever find each other.
 func (p *Publisher) Publish(ctx context.Context, runID job.RunID, jobID job.ID) error {
+	ctx, span := tracer.Start(ctx, "orbit.runs publish",
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			semconv.MessagingSystemKafka,
+			semconv.MessagingDestinationName(RunsTopic),
+			attribute.Int64("orbit.run_id", int64(runID)),
+			attribute.Int64("orbit.job_id", int64(jobID)),
+		),
+	)
+	defer span.End()
+
 	body, err := json.Marshal(runMessage{RunID: runID})
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "marshal failed")
 		return fmt.Errorf("queue: marshal run %d: %w", runID, err)
 	}
-	return p.writer.WriteMessages(ctx, kafka.Message{
+
+	msg := kafka.Message{
 		Key:   fmt.Appendf(nil, "%d", jobID),
 		Value: body,
-	})
+	}
+	// The actual hand-off: serialize the span we just started into this
+	// specific message's headers. Nothing on the consuming side knows
+	// this span exists until it reads these bytes back out.
+	otel.GetTextMapPropagator().Inject(ctx, kafkaHeaderCarrier{headers: &msg.Headers})
+
+	if err := p.writer.WriteMessages(ctx, msg); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "publish failed")
+		return err
+	}
+	return nil
 }
 
 func (p *Publisher) Close() error {
@@ -134,7 +169,8 @@ func NewConsumer(brokers []string, groupID, topic string) *Consumer {
 }
 
 // Next blocks until a message is available or ctx is cancelled, and
-// returns the RunID plus a commit function.
+// returns a context carrying the consumer span (see below), the RunID,
+// and a commit function.
 //
 // Deliberately NOT auto-committing: the offset should only advance once
 // the run has actually been claimed (or found already-claimed) in
@@ -147,21 +183,47 @@ func NewConsumer(brokers []string, groupID, topic string) *Consumer {
 // run already 'running' (or finished) and does nothing -- the same
 // fencing built for CompleteRun/FailRun is what makes Kafka's
 // at-least-once guarantee safe to build on here, for free.
-func (c *Consumer) Next(ctx context.Context) (job.RunID, func(context.Context) error, error) {
+//
+// The returned context is NOT ctx enriched -- it's a fresh context whose
+// span is a CHILD of whatever the producer injected into this message's
+// headers, extracted via kafkaHeaderCarrier. The incoming ctx (the
+// consume loop's own, unrelated context) has nothing to do with the
+// producer's trace; the whole point of the extract step is to reconnect
+// to a trace that started in a different process, at a different time,
+// using nothing but the string the producer wrote into this message. The
+// consumer span stays open until commit runs, so it brackets the full
+// claim-execute-report cycle -- callers should use the returned context
+// for any further spans (claim, execute, complete) so they nest correctly
+// underneath it in the trace viewer.
+func (c *Consumer) Next(ctx context.Context) (context.Context, job.RunID, func(context.Context) error, error) {
 	msg, err := c.reader.FetchMessage(ctx)
 	if err != nil {
-		return 0, nil, fmt.Errorf("queue: fetch: %w", err)
+		return ctx, 0, nil, fmt.Errorf("queue: fetch: %w", err)
 	}
+
+	msgCtx := otel.GetTextMapPropagator().Extract(ctx, kafkaHeaderCarrier{headers: &msg.Headers})
+	msgCtx, span := tracer.Start(msgCtx, "orbit.runs consume",
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			semconv.MessagingSystemKafka,
+			semconv.MessagingDestinationName(RunsTopic),
+		),
+	)
 
 	var m runMessage
 	if err := json.Unmarshal(msg.Value, &m); err != nil {
-		return 0, nil, fmt.Errorf("queue: unmarshal: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "unmarshal failed")
+		span.End()
+		return ctx, 0, nil, fmt.Errorf("queue: unmarshal: %w", err)
 	}
+	span.SetAttributes(attribute.Int64("orbit.run_id", int64(m.RunID)))
 
 	commit := func(ctx context.Context) error {
+		defer span.End()
 		return c.reader.CommitMessages(ctx, msg)
 	}
-	return m.RunID, commit, nil
+	return msgCtx, m.RunID, commit, nil
 }
 
 func (c *Consumer) Close() error {

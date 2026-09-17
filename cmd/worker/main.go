@@ -38,12 +38,22 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+
 	"github.com/vaibhavdangaich/orbit/internal/job"
 	"github.com/vaibhavdangaich/orbit/internal/metrics"
 	"github.com/vaibhavdangaich/orbit/internal/queue"
 	"github.com/vaibhavdangaich/orbit/internal/ratelimit"
 	"github.com/vaibhavdangaich/orbit/internal/store"
+	"github.com/vaibhavdangaich/orbit/internal/tracing"
 )
+
+// tracer is cmd/worker's own named tracer -- spans started here (claim,
+// execute) show up nested under the consumer span internal/queue.Consumer.Next
+// started for this message, because they're all given the same ctx chain.
+var tracer = otel.Tracer("orbit/worker")
 
 func main() {
 	workerID := envOr("ORBIT_WORKER_ID", defaultWorkerID())
@@ -58,9 +68,24 @@ func main() {
 	redisAddr := envOr("ORBIT_REDIS_ADDR", ratelimit.DefaultDevAddr)
 	rateLimitPerTenant := envIntOr("ORBIT_RATE_LIMIT_PER_TENANT", 10)
 	metricsAddr := envOr("ORBIT_METRICS_ADDR", ":9102")
+	otlpEndpoint := envOr("ORBIT_OTLP_ENDPOINT", "localhost:4317")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Same non-fatal treatment as metrics.Serve just below: an unreachable
+	// Jaeger shouldn't stop this worker from claiming and executing runs.
+	shutdownTracing, err := tracing.Init(ctx, "orbit-worker", otlpEndpoint)
+	if err != nil {
+		log.Printf("tracing: %v (continuing without spans)", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shutdownCtx); err != nil {
+			log.Printf("tracing: shutdown: %v", err)
+		}
+	}()
 
 	// A failed bind here is logged, not fatal -- running several worker
 	// replicas on one machine for a local demo means they'd all try this
@@ -124,7 +149,7 @@ func consumeLoop(ctx context.Context, s *store.Store, consumer *queue.Consumer, 
 			return
 		}
 
-		runID, commit, err := consumer.Next(ctx)
+		msgCtx, runID, commit, err := consumer.Next(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -133,7 +158,12 @@ func consumeLoop(ctx context.Context, s *store.Store, consumer *queue.Consumer, 
 			continue
 		}
 
-		handleRunID(ctx, s, limiter, workerID, lease, runID)
+		// msgCtx, not ctx: it carries the consumer span Next started as a
+		// child of whatever the producer injected into this message's
+		// headers. Passing it (not the loop's own ctx) down through claim,
+		// execute, and report is what makes those show up nested under
+		// that span in Jaeger instead of as orphaned, trace-less work.
+		handleRunID(msgCtx, s, limiter, workerID, lease, runID)
 
 		// Committed unconditionally -- including when handleRunID
 		// deferred the run for being rate-limited. See handleRunID's
@@ -187,7 +217,14 @@ func handleRunID(ctx context.Context, s *store.Store, limiter *ratelimit.Limiter
 		return
 	}
 
-	r, ok, err := s.ClaimRun(ctx, runID, workerID, lease)
+	claimCtx, claimSpan := tracer.Start(ctx, "orbit.worker claim_run")
+	r, ok, err := s.ClaimRun(claimCtx, runID, workerID, lease)
+	claimSpan.SetAttributes(attribute.Bool("orbit.claimed", ok))
+	if err != nil {
+		claimSpan.RecordError(err)
+		claimSpan.SetStatus(codes.Error, "claim failed")
+	}
+	claimSpan.End()
 	if err != nil {
 		log.Printf("run %d: claim: %v", runID, err)
 		return
@@ -242,9 +279,15 @@ func runOne(ctx context.Context, s *store.Store, workerID string, r job.Run) {
 		return
 	}
 
+	execCtx, execSpan := tracer.Start(ctx, "orbit.worker execute")
 	start := time.Now()
-	execErr := execute(ctx, j.Payload)
+	execErr := execute(execCtx, j.Payload)
 	metrics.ExecutionDuration.Observe(time.Since(start).Seconds())
+	if execErr != nil {
+		execSpan.RecordError(execErr)
+		execSpan.SetStatus(codes.Error, "execute failed")
+	}
+	execSpan.End()
 
 	if execErr == nil {
 		if err := s.CompleteRun(ctx, r.ID, workerID); err != nil && !errors.Is(err, store.ErrStale) {

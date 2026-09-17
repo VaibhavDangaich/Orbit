@@ -25,6 +25,7 @@ import (
 	"github.com/vaibhavdangaich/orbit/internal/metrics"
 	"github.com/vaibhavdangaich/orbit/internal/queue"
 	"github.com/vaibhavdangaich/orbit/internal/store"
+	"github.com/vaibhavdangaich/orbit/internal/tracing"
 )
 
 func main() {
@@ -40,6 +41,7 @@ func main() {
 	kafkaBrokers := strings.Split(envOr("ORBIT_KAFKA_BROKERS", strings.Join(queue.DefaultDevBrokers, ",")), ",")
 	kafkaPartitions := envIntOr("ORBIT_KAFKA_PARTITIONS", 3)
 	metricsAddr := envOr("ORBIT_METRICS_ADDR", ":9101")
+	otlpEndpoint := envOr("ORBIT_OTLP_ENDPOINT", "localhost:4317")
 
 	// signal.NotifyContext returns a context that's cancelled the moment
 	// this process receives SIGINT (Ctrl+C) or SIGTERM (what `docker stop`
@@ -50,6 +52,20 @@ func main() {
 	// second Ctrl+C isn't needed to actually exit once we return.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Same non-fatal treatment as metrics.Serve below: an unreachable
+	// Jaeger shouldn't stop this scheduler from campaigning and ticking.
+	shutdownTracing, err := tracing.Init(ctx, "orbit-scheduler", otlpEndpoint)
+	if err != nil {
+		log.Printf("tracing: %v (continuing without spans)", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shutdownCtx); err != nil {
+			log.Printf("tracing: shutdown: %v", err)
+		}
+	}()
 
 	startupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	s, err := store.New(startupCtx, dsn)

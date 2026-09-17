@@ -8,8 +8,26 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/vaibhavdangaich/orbit/internal/job"
 )
+
+// TestMain installs a real (but non-exporting) TracerProvider and the W3C
+// propagator before any test runs. Production code gets both from
+// internal/tracing.Init at startup; without this, otel.Tracer falls back
+// to the package-default no-op tracer, whose spans carry an invalid
+// SpanContext and whose Inject/Extract do nothing -- silently defeating
+// the exact header round-trip this package's tests exist to check,
+// without any test actually failing to compile or panicking.
+func TestMain(m *testing.M) {
+	otel.SetTracerProvider(sdktrace.NewTracerProvider())
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	os.Exit(m.Run())
+}
 
 func testBrokers() []string {
 	if v := os.Getenv("ORBIT_TEST_KAFKA_BROKERS"); v != "" {
@@ -54,12 +72,19 @@ func TestPublishConsumeRoundTrip(t *testing.T) {
 		t.Fatalf("Publish: %v", err)
 	}
 
-	gotRunID, commit, err := con.Next(ctx)
+	msgCtx, gotRunID, commit, err := con.Next(ctx)
 	if err != nil {
 		t.Fatalf("Next: %v", err)
 	}
 	if gotRunID != wantRunID {
 		t.Fatalf("RunID = %d, want %d", gotRunID, wantRunID)
+	}
+	// The whole point of the header carrier: msgCtx should carry a real
+	// span, extracted from headers Publish injected into a completely
+	// separate message send -- not just whatever ctx this test happened to
+	// call Next with.
+	if sc := trace.SpanFromContext(msgCtx).SpanContext(); !sc.IsValid() {
+		t.Fatalf("Next: returned context has no valid span; header propagation didn't round-trip")
 	}
 	if err := commit(ctx); err != nil {
 		t.Fatalf("commit: %v", err)
