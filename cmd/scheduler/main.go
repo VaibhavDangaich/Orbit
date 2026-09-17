@@ -152,6 +152,8 @@ func runWithLeaderElection(ctx context.Context, el *election.Election, nodeID st
 		resignCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		if err := el.Resign(resignCtx); err != nil {
 			log.Printf("resign: %v", err)
+		} else {
+			log.Printf("resigned leadership")
 		}
 		cancel()
 		return

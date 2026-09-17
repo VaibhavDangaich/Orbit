@@ -98,6 +98,24 @@ func NewPublisher(brokers []string, topic string) *Publisher {
 			// unbounded write here would mean a slow/unreachable broker
 			// stalls Postgres locks too, not just Kafka.
 			WriteTimeout: 5 * time.Second,
+			// Found by load testing, not by inspection: kafka-go's
+			// Writer batches internally, and its BatchTimeout default
+			// (1s if left unset) is how long WriteMessages waits for
+			// more messages to arrive before flushing whatever it has.
+			// DispatchOutbox calls Publish for ONE row at a time, in a
+			// sequential loop, holding a Postgres transaction open for
+			// the duration -- so every single dispatched run was paying
+			// a full second of pure linger, serialized, with nothing
+			// else to batch with. A load test seeding 1000 due jobs
+			// materialized only ~200 in 3 minutes, an order of
+			// magnitude under the ORBIT_BATCH_SIZE/ORBIT_POLL_INTERVAL
+			// ceiling documented in cmd/loadtest -- this was why. 10ms
+			// is short enough that a single-message write returns
+			// promptly instead of lingering, while still leaving room
+			// for the library to coalesce genuinely concurrent writes
+			// if this code path is ever changed to publish more than
+			// one row per call.
+			BatchTimeout: 10 * time.Millisecond,
 		},
 	}
 }

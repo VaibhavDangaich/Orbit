@@ -209,6 +209,8 @@ Every one of these is implemented and covered by a test that proves the property
 | **Metrics as a cross-cutting exception to strict containment** | `internal/metrics` | Verified live: real Prometheus scrape of both binaries via `host.docker.internal`, real Grafana query through its own provisioned datasource proxy -- `orbit_runs_claimed_total{path="sweep"}` and `orbit_runs_completed_total{status="succeeded"}` both landed on the exact count of runs actually observed executing, not just a metric that compiles |
 | **Distributed tracing across an async boundary** | `internal/tracing`, `internal/queue/tracing.go` (`kafkaHeaderCarrier`) | HTTP has a standard header slot for trace context and middleware that injects/extracts it automatically; Kafka has neither. `kafkaHeaderCarrier` bridges OpenTelemetry's `propagation.TextMapCarrier` interface to `kafka.Header` slices, so a span started in `cmd/scheduler` survives sitting in a topic and resumes as the parent of a span started in a completely different `cmd/worker` process -- verified live via Jaeger's API: producer (`orbit.runs publish`) and consumer (`orbit.runs consume`) spans share one trace ID with correct parent-child linkage, and `claim_run`/`execute` spans nest correctly underneath |
 | **Two independent self-healing mechanisms composing correctly** | `deploy/k8s/scheduler.yaml` (2 replicas, `PodDisruptionBudget`) | etcd's election and Kubernetes' own reconciliation loop solve *different* failure modes and don't know about each other -- verified live on a real `kind` cluster: deleting the leader pod triggered a graceful `Resign`, the etcd-elected standby took over in ~2s, and, independently, the Deployment controller replaced the deleted pod to restore replica count |
+| **Real load testing surfaces real bugs** | `cmd/loadtest`, `internal/queue.NewPublisher` (`BatchTimeout`) | A load test isn't a formality: seeding 1000 jobs found kafka-go's default 1-second producer linger silently serializing every dispatch -- a one-line fix produced a ~9x throughput improvement, with before/after P50/P95/P99 numbers to show it, not just a claim that it's "fast" |
+| **"Kill -9 everything" as a literal test plan, not a slogan** | `deploy/compose` (Kafka outage), any running scheduler/worker (SIGKILL) | Three real process/infra kills -- a worker mid-execution, the leader mid-burst, the message broker mid-workload -- each checked against one invariant (seeded count vs. terminal count, scoped to the test's own tenant): zero loss, zero double-execution, every time |
 
 ## Proven under real failure, not just designed for it
 
@@ -300,6 +302,48 @@ flowchart LR
 ```
 
 Zero mixing across dozens of firings — every job-A run went to worker 3, every job-B run went to worker 1. Worker 2 sitting idle isn't a bug: with only 2 distinct job keys spread across 3 partitions, one partition getting no traffic is exactly what you'd expect. With real job/tenant cardinality this evens out on its own.
+
+## Load and chaos testing
+
+**Why not k6.** k6 measures request/response latency over a network protocol. Nothing in orbit's own due-to-completed path is an HTTP request — it's a Postgres poll, an outbox dispatch, and a Kafka hop. Pointing k6 at it would mean either building `cmd/api` (a whole deferred phase, pulled in just to give a load tool something to call) or aiming it at `/metrics`, which measures nothing about the actual workload. `cmd/loadtest` is a plain Go client instead: it seeds jobs through the same `Store` every other binary uses, waits for them to reach a terminal run, and reads the results back the same way.
+
+```bash
+go run ./cmd/loadtest   # ORBIT_LOADTEST_JOBS (default 1000), ORBIT_LOADTEST_TENANTS (default 20)
+```
+
+Latency is reported as three real segments, not one end-to-end blob, using columns every run already has:
+
+| Segment | Formula | What dominates it |
+|---|---|---|
+| Scheduler lag | `created_at - scheduled_for` | `ORBIT_POLL_INTERVAL` / `ORBIT_BATCH_SIZE` — the materialize ceiling is `batch_size / poll_interval` runs/sec, by construction |
+| Dispatch + delivery | `started_at - created_at` | Outbox tick + Kafka publish/consume |
+| Execution | `finished_at - started_at` | `execute()` itself |
+
+Jobs are spread across many tenants (`ORBIT_LOADTEST_TENANTS`), not one — seeding a single-tenant burst would measure `internal/ratelimit`'s per-tenant cap (10/s by default), not the pipeline's real throughput. A single-tenant burst is its own, different, useful measurement (see "known gap" below), not this one's default.
+
+**A real bug, found by running it, not by inspection.** The first run (1000 jobs, poll_interval=5s, batch_size=50 → a documented ceiling of 10 runs/sec) materialized only 200 jobs in 3 minutes — nowhere near the ~1800 the ceiling predicts. Cause: `internal/queue.Publisher`'s `kafka.Writer` never set `BatchTimeout`, so it used kafka-go's default of a full second. `store.DispatchOutbox` calls `Publish` once per row in a sequential loop, each call blocking on that second of pure linger with nothing else to batch with — every dispatched run was paying ~1s of avoidable delay, serialized. Fixed with one line (`BatchTimeout: 10 * time.Millisecond`) and re-run:
+
+| Segment | Before fix (p50 / p99) | After fix (p50 / p99) |
+|---|---|---|
+| Scheduler lag | 1m40.8s / 2m31.0s | 51.5s / 1m36.5s |
+| Dispatch + delivery | 16.1s / 40.4s | 341ms / 636ms |
+| Execution | 11ms / 28ms | 1ms / 4ms |
+| End-to-end | 1m41.8s / 2m51.2s | 51.6s / 1m37.0s |
+| Jobs completed in 3 min | 200 / 1000 | 1000 / 1000 |
+
+After the fix, the "before" 3-minute timeout (200/1000) became a 97-second full completion (1000/1000) — the scheduler-lag numbers now track the stated `batch_size`/`poll_interval` ceiling almost exactly, which is what a defensible P99 looks like: reproducible from the config, not a number pulled out of a run.
+
+**Known gap, stated plainly**: found but not chased further — seeding all jobs under one tenant (a single-tenant burst) makes a run's execution time exceed `ORBIT_LEASE` (30s default) trigger real, repeated reap-and-retry cycles even with zero worker crashes, since `ReapExpiredLeases` can't distinguish "abandoned" from "still running, just slow." Worth knowing before setting `ORBIT_LEASE` shorter than your slowest expected job.
+
+### Chaos: kill -9 everything, prove no loss
+
+Three scenarios, each with the invariant decided before running anything: seeded count vs. terminal `job_runs` count, scoped to the test's own tenant so shared-infra noise can't contaminate the result.
+
+**1. SIGKILL a worker mid-execution.** Seeded jobs with an 8-second payload; too short — the worker had already called `CompleteRun` before the kill landed, since I was watching for `status='running'` and killing by hand. Re-run with a 15-second payload (safely under the 30s lease) closed that race: `kill -9` the worker holding the lease, watch `ReapExpiredLeases` reclaim it (`pending`, `attempt=2`) once the lease genuinely expired, watch a *different*, surviving worker claim and complete it. **Result: succeeded on attempt 2, exactly once — no double-execution, no loss.**
+
+**2. SIGKILL the leader scheduler mid-burst.** Seeded 200 jobs, killed the leader (`kill -9`, no `Resign()` — the crash path, not the graceful one already shown above) after only 100 of 200 had materialized. Standby elected leader in ~6-7s, bounded by `ORBIT_ELECTION_TTL` (10s) since there was no graceful handoff to speed it up. The new leader resumed materializing the other 100 without being told to. **Result: 200/200 succeeded, 0 failed, zero jobs lost across the gap** — this is the actual scenario the outbox pattern and the fenced `pending`-state design exist for, and "killed it mid-burst and lost nothing" is the sentence that proves it, not a description of the mechanism.
+
+**3. Stop Kafka entirely, mid-workload.** Seeded 30 jobs, then `docker stop`'d the Kafka container. Scheduler logged repeated `dial tcp ...: connection refused` on every dispatch attempt and kept ticking; worker logged the same on every consume attempt and kept running — neither crashed. `sweepLoop`'s periodic Postgres-only `SKIP LOCKED` scan, which never touches Kafka, claimed and executed all 30 anyway. **Result: 30/30 succeeded with the message broker completely down for the whole run** — checked via `job_runs` state, not by grepping for a "sweep claimed" log line, since that line only prints when a sweep pass actually finds something and its *absence* proves nothing either way.
 
 ## Getting started
 
@@ -497,6 +541,7 @@ cmd/
   scheduler/     leader-elected loop: materialize due runs, reap dead leases, dispatch to Kafka
   worker/        claims + executes runs, via Kafka (primary) and a periodic sweep (safety net)
   tui/           bubbletea dashboard: read-only, live job/run-status view (internal/store/dashboard.go)
+  loadtest/      seeds a burst of jobs, waits for completion, reports P50/P95/P99 latency by segment
 internal/
   job/           pure domain logic (Schedule, Job, Run) -- no database, no infra, fully unit-tested
   store/         the only package that knows Postgres exists
@@ -543,7 +588,7 @@ Stated explicitly rather than glossed over:
 - [x] Prometheus metrics + Grafana (see "Observability" below)
 - [x] OpenTelemetry distributed tracing across the scheduler → Kafka → worker boundary (see "Observability")
 - [x] Kubernetes deployment manifests (see "Kubernetes")
-- [ ] Load testing (k6) with published P50/P95/P99 numbers, plus chaos testing (kill -9 everything, prove no loss)
+- [x] Load testing with published P50/P95/P99 numbers, plus chaos testing (kill -9 everything, prove no loss) — see "Load and chaos testing"
 - [x] A terminal dashboard (`bubbletea`) for live job/run/leader/worker visibility
 
 ## Testing
