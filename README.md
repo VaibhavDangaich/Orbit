@@ -11,6 +11,15 @@ Define a job with a schedule (`@every 30s`) and a payload. `orbit` fires it on t
 ## Architecture
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {
+  'background': '#0d1117',
+  'primaryColor': '#21262d',
+  'primaryTextColor': '#e6edf3',
+  'primaryBorderColor': '#58a6ff',
+  'lineColor': '#8b949e',
+  'textColor': '#e6edf3',
+  'fontSize': '16px'
+}}}%%
 flowchart TB
     subgraph COORD["🗳️  COORDINATION"]
         direction LR
@@ -57,10 +66,10 @@ flowchart TB
     classDef follower fill:#495057,stroke:#212529,color:#adb5bd
     classDef worker fill:#4dabf7,stroke:#1864ab,color:#fff,font-weight:bold
 
-    style COORD fill:#fff3bf,stroke:#f08c00,stroke-width:2px
-    style COMPUTE fill:#e7f5ff,stroke:#1971c2,stroke-width:2px
-    style TRUTH fill:#d3f9d8,stroke:#2f9e44,stroke-width:2px
-    style STREAM fill:#ffe8cc,stroke:#e8590c,stroke-width:2px
+    style COORD fill:#3d3300,stroke:#ffd43b,stroke-width:2px,color:#ffd43b
+    style COMPUTE fill:#0c2d48,stroke:#4dabf7,stroke-width:2px,color:#4dabf7
+    style TRUTH fill:#0b3d0b,stroke:#51cf66,stroke-width:2px,color:#51cf66
+    style STREAM fill:#4a1e00,stroke:#ff922b,stroke-width:2px,color:#ff922b
 ```
 
 Only the scheduler drawn in red is actually doing anything at any given moment — the others are idle followers, watching etcd, ready to take over.
@@ -68,6 +77,30 @@ Only the scheduler drawn in red is actually doing anything at any given moment �
 ## How a job runs, end to end
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {
+  'background': '#0d1117',
+  'primaryColor': '#21262d',
+  'primaryTextColor': '#e6edf3',
+  'primaryBorderColor': '#58a6ff',
+  'lineColor': '#8b949e',
+  'textColor': '#e6edf3',
+  'actorBkg': '#21262d',
+  'actorBorder': '#58a6ff',
+  'actorTextColor': '#e6edf3',
+  'actorLineColor': '#8b949e',
+  'signalColor': '#8b949e',
+  'signalTextColor': '#e6edf3',
+  'labelBoxBkgColor': '#21262d',
+  'labelBoxBorderColor': '#58a6ff',
+  'labelTextColor': '#e6edf3',
+  'loopTextColor': '#e6edf3',
+  'noteBkgColor': '#3d3300',
+  'noteTextColor': '#ffd60a',
+  'noteBorderColor': '#ffd60a',
+  'activationBkgColor': '#30363d',
+  'activationBorderColor': '#58a6ff',
+  'sequenceNumberColor': '#0d1117'
+}}}%%
 sequenceDiagram
     autonumber
     participant J as 📋 jobs
@@ -77,7 +110,7 @@ sequenceDiagram
     participant W as 🔧 Worker
     participant R as 🗂️ job_runs
 
-    rect rgb(231, 245, 255)
+    rect rgb(13, 45, 74)
     Note over S,J: every poll_interval — only on the LEADER
     S->>J: SELECT due jobs FOR UPDATE SKIP LOCKED
     S->>R: INSERT (job_id, scheduled_for) ON CONFLICT DO NOTHING
@@ -86,13 +119,13 @@ sequenceDiagram
     Note right of O: all four writes are ONE Postgres transaction
     end
 
-    rect rgb(255, 243, 191)
+    rect rgb(74, 58, 10)
     S->>O: SELECT undispatched FOR UPDATE OF o SKIP LOCKED
     S->>K: publish(run_id) — key = job_id, so it's always the same partition
     S->>O: UPDATE dispatched_at = now()
     end
 
-    rect rgb(211, 249, 216)
+    rect rgb(15, 64, 35)
     K-->>W: deliver (this worker owns the partition)
     W->>R: UPDATE status='running' WHERE status='pending'
     alt claimed successfully
@@ -117,6 +150,17 @@ Blue = materialize, yellow = dispatch, green = claim-execute-report. Each zone i
 ## Run lifecycle
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {
+  'background': '#0d1117',
+  'primaryColor': '#21262d',
+  'primaryTextColor': '#e6edf3',
+  'primaryBorderColor': '#58a6ff',
+  'lineColor': '#8b949e',
+  'textColor': '#e6edf3',
+  'noteBkgColor': '#3d3300',
+  'noteTextColor': '#ffd60a',
+  'noteBorderColor': '#ffd60a'
+}}}%%
 stateDiagram-v2
     [*] --> pending: MaterializeDueRuns
 
@@ -139,7 +183,9 @@ stateDiagram-v2
     end note
 
     classDef terminal fill:#495057,color:#fff
+    classDef active fill:#0c2d48,stroke:#58a6ff,color:#e6edf3
     class succeeded,failed terminal
+    class pending,running active
 ```
 
 ## System design concepts, and where they actually live
@@ -165,6 +211,30 @@ Every diagram above is the intended design. These two are what actually happened
 **Leader failover — graceful vs. crash, side by side:**
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {
+  'background': '#0d1117',
+  'primaryColor': '#21262d',
+  'primaryTextColor': '#e6edf3',
+  'primaryBorderColor': '#58a6ff',
+  'lineColor': '#8b949e',
+  'textColor': '#e6edf3',
+  'actorBkg': '#21262d',
+  'actorBorder': '#58a6ff',
+  'actorTextColor': '#e6edf3',
+  'actorLineColor': '#8b949e',
+  'signalColor': '#8b949e',
+  'signalTextColor': '#e6edf3',
+  'labelBoxBkgColor': '#21262d',
+  'labelBoxBorderColor': '#58a6ff',
+  'labelTextColor': '#e6edf3',
+  'loopTextColor': '#e6edf3',
+  'noteBkgColor': '#3d3300',
+  'noteTextColor': '#ffd60a',
+  'noteBorderColor': '#ffd60a',
+  'activationBkgColor': '#30363d',
+  'activationBorderColor': '#58a6ff',
+  'sequenceNumberColor': '#0d1117'
+}}}%%
 sequenceDiagram
     participant A as Scheduler A
     participant E as etcd
@@ -174,14 +244,14 @@ sequenceDiagram
     E-->>A: 🔴 elected leader
     B->>E: Campaign() — blocks, waiting
 
-    rect rgb(211, 249, 216)
+    rect rgb(15, 64, 35)
     Note over A,B: 🟢 Graceful shutdown — SIGTERM
     A->>E: Resign()
     E-->>B: 🔴 elected leader
     Note over A,B: same second in the logs
     end
 
-    rect rgb(255, 214, 214)
+    rect rgb(74, 20, 20)
     Note over A,B: 🔥 Crash — SIGKILL, no Resign()
     A--xE: keepalives stop
     Note over E: lease expires after ORBIT_ELECTION_TTL (3s in the demo)
@@ -195,6 +265,15 @@ A clean shutdown hands off in under a second because `Resign()` actively release
 **Consistent hashing, holding up under a live 2-job, 3-worker run:**
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {
+  'background': '#0d1117',
+  'primaryColor': '#21262d',
+  'primaryTextColor': '#e6edf3',
+  'primaryBorderColor': '#58a6ff',
+  'lineColor': '#8b949e',
+  'textColor': '#e6edf3',
+  'fontSize': '16px'
+}}}%%
 flowchart LR
     JA["Job A<br/><i>@every 1s</i>"]:::jobA
     JB["Job B<br/><i>@every 1s</i>"]:::jobB
@@ -209,7 +288,7 @@ flowchart LR
 
     classDef jobA fill:#ff922b,stroke:#d9480f,color:#fff,font-weight:bold
     classDef jobB fill:#7950f2,stroke:#5f3dc4,color:#fff,font-weight:bold
-    classDef hot fill:#ffd43b,stroke:#f08c00
+    classDef hot fill:#ffd43b,stroke:#f08c00,color:#000
     classDef cold fill:#e9ecef,stroke:#adb5bd,color:#868e96
     classDef idle fill:#f1f3f5,stroke:#ced4da,color:#adb5bd
 ```
