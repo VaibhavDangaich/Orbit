@@ -82,7 +82,25 @@ services:
       timeout: 5s
       retries: 20
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      # Host 6380, not the Redis default 6379: this machine already has a
+      # native Redis listening on 6379 (`lsof -nP -iTCP:6379 -sTCP:LISTEN`
+      # showed a redis-server process bound there before this service was
+      # added) -- the exact same class of collision as Postgres on 5432
+      # and Kafka on 9092/9093 above, caught the same way.
+      - "6380:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
 volumes:
   pgdata:
   etcddata:
   kafkadata:
+  redisdata:

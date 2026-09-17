@@ -203,6 +203,7 @@ Every one of these is implemented and covered by a test that proves the property
 | **Consistent hashing** | `internal/hashring` | Adding a 6th node to a 5-node ring remaps ~16% of keys (measured), not the ~83% a naive `hash % N` would |
 | **Partition-aware message routing** | `internal/queue/balancer.go` (`HashBalancer`) | A job's runs consistently land on the same Kafka partition (and, in steady state, the same worker) — verified live: 27/27 job-A firings via Kafka went to one worker, 28/28 job-B firings went to a different one, zero mixing. The single exception (1 job-A run landing on job-B's worker) came from the reconciliation sweep, which bypasses Kafka and therefore partition affinity entirely — expected, not a bug |
 | **Reconciliation as a safety net, not a religion** | `cmd/worker` (`sweepLoop`) | If the outbox/Kafka path is ever down, the original batch-poll claim path still finds the work |
+| **Per-tenant rate limiting without spending retries** | `internal/ratelimit` (Lua-scripted token bucket in Redis), `cmd/worker` (`handleRunID`) | An `EVAL`-atomic token bucket, checked before `ClaimRun` -- proven not to over-admit under concurrency in `TestAllowNoOverAdmitConcurrent`, the same "race for one slot" proof shape as `TestClaimRunsNoDoubleClaim`. A throttled run is deferred to `sweepLoop`, not routed through `FailRun`, so backpressure never spends one of the run's real `MaxAttempts` |
 
 ## Proven under real failure, not just designed for it
 
@@ -300,7 +301,7 @@ Zero mixing across dozens of firings — every job-A run went to worker 3, every
 Requires Docker and Go 1.26+.
 
 ```bash
-# 1. Start Postgres, etcd, and Kafka
+# 1. Start Postgres, etcd, Kafka, and Redis
 docker compose -f deploy/compose/docker-compose.yml up -d
 
 # 2. Apply the schema
@@ -348,6 +349,8 @@ Both binaries are configured entirely by environment variables (no config file, 
 | `ORBIT_BATCH_SIZE` | `10` | Max rows the sweep claims per pass |
 | `ORBIT_KAFKA_BROKERS` | `localhost:19092` | Comma-separated Kafka brokers |
 | `ORBIT_KAFKA_GROUP` | `orbit-workers` | Consumer group — all workers should share this |
+| `ORBIT_REDIS_ADDR` | `localhost:6380` | Redis address backing the per-tenant rate limiter |
+| `ORBIT_RATE_LIMIT_PER_TENANT` | `10` | Token bucket capacity and refill rate, in requests/sec, applied uniformly to every tenant |
 
 ## Project structure
 
@@ -361,11 +364,12 @@ internal/
   election/      the only package that knows etcd exists
   queue/         the only package that knows Kafka exists
   hashring/      consistent hashing, standalone and fully tested on its own
+  ratelimit/     the only package that knows Redis exists
 migrations/      versioned SQL, golang-migrate-compatible naming
-deploy/compose/  local dev infrastructure (Postgres, etcd, Kafka)
+deploy/compose/  local dev infrastructure (Postgres, etcd, Kafka, Redis)
 ```
 
-Every `internal/` package is a hard boundary, not a convention: the Go compiler itself blocks any package outside this module from importing it. Each infra dependency (Postgres, etcd, Kafka) is contained to exactly one package that owns it; nothing else in the codebase imports a driver directly.
+Every `internal/` package is a hard boundary, not a convention: the Go compiler itself blocks any package outside this module from importing it. Each infra dependency (Postgres, etcd, Kafka, Redis) is contained to exactly one package that owns it; nothing else in the codebase imports a driver directly.
 
 ## Design decisions worth knowing before an interview asks about them
 
@@ -382,11 +386,15 @@ Stated explicitly rather than glossed over:
 - **No API yet** — jobs are inserted directly via SQL. A `cmd/api` service is the natural next step.
 - **`cmd/worker` has a per-run N+1 query** (`GetJob` after every claim, to fetch the payload) — fine at current batch sizes, a known candidate for folding into the claim query itself if it ever becomes a hot path.
 - **No pluggable executor** — `cmd/worker/execute.go` is a single function, not an `Executor` interface with a registry, because there's exactly one kind of job so far. Building the abstraction before a second kind exists would be solving a problem this system doesn't have yet.
-- **No rate limiting, no observability stack, no Kubernetes manifests yet** — all on the roadmap below.
+- **Rate limiting is global-shape, not per-tenant configurable** — `ORBIT_RATE_LIMIT_PER_TENANT` sets one requests/sec ceiling applied uniformly to every tenant's own bucket. A database-backed, per-tenant-configurable limit is the natural next step once real tenant traffic makes that a genuine need, not before.
+- **A rate-limited run waits for the sweep, not instant redelivery** — `cmd/worker` never routes a throttled run through `FailRun` (that would spend a real retry attempt on pure backpressure), so it stays `pending` and is only retried on `sweepLoop`'s interval (default 30s). A severely throttled tenant's jobs are slower to drain than a healthy tenant's, on purpose — stated here rather than left as a surprise.
+- **`sweepLoop` doesn't enforce the rate limit at all** — `ClaimRuns`' batch scan claims up to `ORBIT_BATCH_SIZE` pending runs regardless of tenant, with no call into `internal/ratelimit`. This is intentional (the sweep is what *drains* a throttled tenant's backlog; gating it too would mean a severely throttled tenant never makes progress at all) but it does mean a tenant sitting in the sweep's batch briefly runs unmetered — worth knowing before assuming the limit holds everywhere, all the time.
+- **The rate limiter fails open if Redis is unreachable** — `cmd/worker` logs it loudly and lets the run proceed as if allowed, rather than treating a Redis outage as "reject everything." The reasoning (favoring availability of the Kafka fast path over strict enforcement) is in `handleRunID`'s comment; the tradeoff is that a Redis outage means tenants are temporarily unlimited, not temporarily blocked.
+- **No observability stack, no Kubernetes manifests yet** — both on the roadmap below.
 
 ## Roadmap
 
-- [ ] Redis-backed per-tenant rate limiting
+- [x] Redis-backed per-tenant rate limiting
 - [ ] OpenTelemetry tracing + Prometheus/Grafana
 - [ ] Kubernetes deployment manifests
 - [ ] Load testing (k6) with published P50/P95/P99 numbers, plus chaos testing (kill -9 everything, prove no loss)
@@ -398,6 +406,6 @@ Stated explicitly rather than glossed over:
 go test ./... -race
 ```
 
-Every package with infrastructure dependencies (`internal/store`, `internal/queue`) skips cleanly with a clear message if Postgres/Kafka isn't running, rather than failing opaquely. `internal/job` and `internal/hashring` are pure logic and need nothing running at all.
+Every package with infrastructure dependencies (`internal/store`, `internal/queue`, `internal/ratelimit`) skips cleanly with a clear message if Postgres/Kafka/Redis isn't running, rather than failing opaquely. `internal/job` and `internal/hashring` are pure logic and need nothing running at all.
 
 Correctness claims in this README aren't just asserted — the ones involving real concurrency or real infrastructure (fencing, leader failover, partition stickiness, zero-duplication under retries) were verified against live Postgres, etcd, and Kafka, not just unit-tested in isolation.

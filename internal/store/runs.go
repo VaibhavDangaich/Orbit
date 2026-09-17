@@ -398,6 +398,43 @@ func (s *Store) ClaimRun(ctx context.Context, runID job.RunID, workerID string, 
 	return r, true, nil
 }
 
+// GetRunTenant looks up which tenant owns runID, via a simple indexed join
+// from job_runs to jobs: job_runs.id is looked up by primary key, and the
+// job_id foreign key is then looked up by jobs' own primary key -- both
+// sides are O(1) index hits, not a scan, so this is cheap enough to call
+// on every Kafka-consumed message without it becoming a hot-path cost.
+//
+// This is deliberately NOT a claim, and deliberately NOT folded into
+// ClaimRun: it does a read-only SELECT with no FOR UPDATE and no mutation
+// at all, so calling it -- even many times, even for a run someone else
+// already claimed -- has zero side effects. cmd/worker's handleRunID
+// calls this BEFORE ClaimRun specifically so it can check the run's
+// tenant against internal/ratelimit ahead of claiming. That ordering
+// matters: rate limiting has to be a pre-claim gate. If a run were
+// claimed first and the rate limit enforced after, the only way to "undo"
+// the claim would be through FailRun -- which increments Attempt and can
+// terminally fail a run that never actually got to execute, just because
+// its tenant was over quota. Backpressure and failure have to stay
+// distinguishable, and the only way to guarantee that is to check the
+// limit before ClaimRun is ever called.
+func (s *Store) GetRunTenant(ctx context.Context, runID job.RunID) (string, error) {
+	const q = `
+		SELECT j.tenant_id
+		FROM job_runs jr
+		JOIN jobs j ON j.id = jr.job_id
+		WHERE jr.id = $1`
+
+	var tenantID string
+	err := s.pool.QueryRow(ctx, q, runID).Scan(&tenantID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("store: get run tenant %d: %w", runID, err)
+	}
+	return tenantID, nil
+}
+
 // DispatchOutbox drains up to limit undispatched outbox rows, calling
 // publish for each and marking it dispatched on success.
 //

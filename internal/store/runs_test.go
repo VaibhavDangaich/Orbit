@@ -488,6 +488,50 @@ func TestClaimRun(t *testing.T) {
 	}
 }
 
+func TestGetRunTenant(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	j := mustCreateJob(t, s, now) // tenant-1, per mustCreateJob
+	if _, err := s.MaterializeDueRuns(ctx, now, 10); err != nil {
+		t.Fatalf("MaterializeDueRuns: %v", err)
+	}
+	ids := undispatchedOutboxRunIDs(t, s, ctx)
+	if len(ids) != 1 {
+		t.Fatalf("expected exactly one pending run, got outbox rows %v", ids)
+	}
+	runID := ids[0]
+
+	tenantID, err := s.GetRunTenant(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunTenant: %v", err)
+	}
+	if tenantID != j.TenantID {
+		t.Fatalf("tenantID = %q, want %q", tenantID, j.TenantID)
+	}
+
+	// The whole point of this method is that it's read-only -- not a
+	// claim. The run must still be exactly as pending as it was before.
+	var status job.RunStatus
+	if err := s.pool.QueryRow(ctx, `SELECT status FROM job_runs WHERE id = $1`, runID).Scan(&status); err != nil {
+		t.Fatalf("query status: %v", err)
+	}
+	if status != job.RunPending {
+		t.Errorf("status after GetRunTenant = %q, want %q (GetRunTenant must not mutate the run)", status, job.RunPending)
+	}
+}
+
+func TestGetRunTenantNotFound(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	_, err := s.GetRunTenant(ctx, job.RunID(999_999_999))
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetRunTenant: err = %v, want ErrNotFound", err)
+	}
+}
+
 func TestDispatchOutbox(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
