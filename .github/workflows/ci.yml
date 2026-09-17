@@ -65,7 +65,16 @@ jobs:
           KAFKA_NODE_ID: 1
           KAFKA_PROCESS_ROLES: broker,controller
           KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:19092
+          # 127.0.0.1, not localhost. Kafka hands this literal string back
+          # to clients as the address to use for the real connection --
+          # including the group coordinator lookup a consumer group makes
+          # before it can read anything. On a GitHub runner "localhost"
+          # resolves to both ::1 and 127.0.0.1 while Docker publishes the
+          # port on IPv4 only, so half of that name's addresses go
+          # nowhere; the symptom is a consumer that hangs in its join
+          # rather than failing cleanly. An IP literal has nothing to
+          # resolve and no second address to fall back to.
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:19092
           KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
           KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
           KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
@@ -122,6 +131,9 @@ jobs:
             psql -h localhost -p 5433 -U scheduler -d scheduler -v ON_ERROR_STOP=1 -f "$f"
           done
 
+      # Same reasoning as the advertised listener: point the suite at IP
+      # literals so nothing in the test path depends on how localhost
+      # happens to resolve on the runner.
       - name: go vet
         run: go vet ./...
 
@@ -130,6 +142,10 @@ jobs:
       # race in that code is the exact class of bug that passes a
       # single-threaded test run and fails in production.
       - name: go test
+        env:
+          ORBIT_TEST_DATABASE_URL: postgres://scheduler:scheduler@127.0.0.1:5433/scheduler?sslmode=disable
+          ORBIT_TEST_KAFKA_BROKERS: 127.0.0.1:19092
+          ORBIT_TEST_REDIS_ADDR: 127.0.0.1:6380
         run: go test -race -count=1 ./...
 
   # Separate job, not a step: it needs no service containers and nothing
