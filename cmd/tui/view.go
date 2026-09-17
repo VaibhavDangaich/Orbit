@@ -76,12 +76,6 @@ var (
 	colorSucceeded = lipgloss.Color("42")  // green
 	colorFailed    = lipgloss.Color("203") // red
 
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("15")).
-			Background(colorAccent).
-			Padding(0, 1)
-
 	helpStyle = lipgloss.NewStyle().Foreground(colorMuted)
 
 	errStyle = lipgloss.NewStyle().Foreground(colorFailed).Bold(true)

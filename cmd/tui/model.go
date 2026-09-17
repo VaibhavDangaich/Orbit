@@ -107,11 +107,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.table.SetWidth(msg.Width)
-		// Leave room for the title, the count boxes, the caption line, and
-		// the help line above the table -- a fixed budget rather than a
+		// Leave room for the banner (6 lines), the tagline, the count
+		// boxes (4 rows + caption), and the help line, plus blank
+		// spacers between sections -- a fixed budget rather than a
 		// perfectly reactive layout, which is plenty for a single-screen
-		// dashboard.
-		h := msg.Height - 10
+		// dashboard. See View() for the exact section list this counts.
+		h := msg.Height - 16
 		if h < 3 {
 			h = 3
 		}
@@ -135,11 +136,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	title := titleStyle.Render("orbit dashboard")
+	banner := renderBanner()
+	tagline := taglineStyle.Render("distributed job scheduler")
 	counts := renderCounts(m.counts, m.runWindow)
 	help := helpStyle.Render("q / ctrl+c: quit  •  ↑/↓: scroll jobs  •  refreshes every " + m.refreshInterval.String())
 
-	sections := []string{title, "", counts, "", m.table.View(), "", help}
+	sections := []string{banner, tagline, "", counts, "", m.table.View(), "", help}
 	if m.err != nil {
 		sections = append(sections, "", errStyle.Render("error refreshing: "+m.err.Error()))
 	}
