@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vaibhavdangaich/orbit/internal/job"
+	"github.com/vaibhavdangaich/orbit/internal/metrics"
 )
 
 // ErrStale is returned by CompleteRun/FailRun when the update didn't
@@ -82,10 +83,8 @@ func (s *Store) MaterializeDueRuns(ctx context.Context, now time.Time, limit int
 
 		fireAt, next, skipped := sched.FastForward(d.nextRunAt, now)
 		if skipped > 0 {
-			// ponytail: log.Printf, not a metric -- fine for a single
-			// process; swap for a real counter in the observability phase
-			// once something is actually scraping this.
 			log.Printf("job %d missed %d occurrence(s), firing once for %s", d.id, skipped, fireAt)
+			metrics.ScheduleMisfires.Add(float64(skipped))
 		}
 
 		var newRunID job.RunID
@@ -109,6 +108,7 @@ func (s *Store) MaterializeDueRuns(ctx context.Context, now time.Time, limit int
 				return created, fmt.Errorf("store: materialize: outbox insert for run %d: %w", newRunID, err)
 			}
 			created++
+			metrics.RunsMaterialized.Inc()
 		}
 
 		if _, err := tx.Exec(ctx,
@@ -197,6 +197,8 @@ func (s *Store) ClaimRuns(ctx context.Context, workerID string, lease time.Durat
 		return nil, fmt.Errorf("store: claim: commit: %w", err)
 	}
 
+	metrics.RunsClaimed.WithLabelValues("sweep").Add(float64(len(claimed)))
+
 	for i := range claimed {
 		claimed[i].Status = job.RunRunning
 		claimed[i].ClaimedBy = &workerID
@@ -232,6 +234,7 @@ func (s *Store) CompleteRun(ctx context.Context, runID job.RunID, workerID strin
 	if tag.RowsAffected() == 0 {
 		return ErrStale
 	}
+	metrics.RunsCompleted.WithLabelValues("succeeded").Inc()
 	return nil
 }
 
@@ -294,6 +297,12 @@ func (s *Store) FailRun(ctx context.Context, runID job.RunID, workerID string, e
 	if err := tx.Commit(ctx); err != nil {
 		return "", fmt.Errorf("store: fail run %d: commit: %w", runID, err)
 	}
+
+	if status == job.RunPending {
+		metrics.RunsCompleted.WithLabelValues("retried").Inc()
+	} else {
+		metrics.RunsCompleted.WithLabelValues("failed").Inc()
+	}
 	return status, nil
 }
 
@@ -346,6 +355,9 @@ func (s *Store) ReapExpiredLeases(ctx context.Context) (int, error) {
 		reaped++
 		if status == job.RunPending {
 			retriedIDs = append(retriedIDs, id)
+			metrics.RunsCompleted.WithLabelValues("retried").Inc()
+		} else {
+			metrics.RunsCompleted.WithLabelValues("failed").Inc()
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -392,6 +404,7 @@ func (s *Store) ClaimRun(ctx context.Context, runID job.RunID, workerID string, 
 	if err != nil {
 		return job.Run{}, false, fmt.Errorf("store: claim run %d: %w", runID, err)
 	}
+	metrics.RunsClaimed.WithLabelValues("kafka").Inc()
 	r.Status = job.RunRunning
 	r.ClaimedBy = &workerID
 	r.ClaimExpiresAt = &expiresAt
@@ -514,6 +527,7 @@ func (s *Store) DispatchOutbox(ctx context.Context, limit int, publish func(cont
 			return dispatched, fmt.Errorf("store: dispatch outbox: mark run %d dispatched: %w", r.runID, err)
 		}
 		dispatched++
+		metrics.RunsDispatched.Inc()
 	}
 
 	if err := tx.Commit(ctx); err != nil {

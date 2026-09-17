@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/vaibhavdangaich/orbit/internal/election"
+	"github.com/vaibhavdangaich/orbit/internal/metrics"
 	"github.com/vaibhavdangaich/orbit/internal/queue"
 	"github.com/vaibhavdangaich/orbit/internal/store"
 )
@@ -38,6 +39,7 @@ func main() {
 	electionTTL := envDurationOr("ORBIT_ELECTION_TTL", 10*time.Second)
 	kafkaBrokers := strings.Split(envOr("ORBIT_KAFKA_BROKERS", strings.Join(queue.DefaultDevBrokers, ",")), ",")
 	kafkaPartitions := envIntOr("ORBIT_KAFKA_PARTITIONS", 3)
+	metricsAddr := envOr("ORBIT_METRICS_ADDR", ":9101")
 
 	// signal.NotifyContext returns a context that's cancelled the moment
 	// this process receives SIGINT (Ctrl+C) or SIGTERM (what `docker stop`
@@ -82,6 +84,15 @@ func main() {
 	publisher := queue.NewPublisher(kafkaBrokers, queue.RunsTopic)
 	defer publisher.Close()
 
+	// A failed bind here is logged, not fatal -- running multiple
+	// scheduler replicas on one machine for a local demo means they'd all
+	// try this same default port unless given distinct ORBIT_METRICS_ADDR
+	// values, and a scheduler whose metrics port lost that race should
+	// still campaign, tick, and dispatch correctly.
+	if err := metrics.Serve(metricsAddr); err != nil {
+		log.Printf("metrics: %v (continuing without a working /metrics endpoint)", err)
+	}
+
 	log.Printf("started: poll_interval=%s batch_size=%d election_ttl=%s kafka_partitions=%d", pollInterval, batchSize, electionTTL, kafkaPartitions)
 	runWithLeaderElection(ctx, el, nodeID, s, publisher, pollInterval, batchSize)
 	log.Printf("stopped")
@@ -99,6 +110,7 @@ func runWithLeaderElection(ctx context.Context, el *election.Election, nodeID st
 		log.Fatalf("campaign: %v", err)
 	}
 	log.Printf("elected leader")
+	metrics.LeaderStatus.Set(1)
 
 	// If our own etcd session dies mid-leadership (lease expired because
 	// we lost connectivity to etcd for longer than electionTTL), cancel
@@ -115,6 +127,7 @@ func runWithLeaderElection(ctx context.Context, el *election.Election, nodeID st
 	}()
 
 	run(leaderCtx, s, publisher, pollInterval, batchSize)
+	metrics.LeaderStatus.Set(0)
 
 	if ctx.Err() != nil {
 		// Real shutdown: resign cleanly instead of just disappearing, so

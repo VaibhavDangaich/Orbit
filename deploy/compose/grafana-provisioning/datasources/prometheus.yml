@@ -1,0 +1,13 @@
+# Grafana auto-loads any datasource file in its provisioning directory on
+# startup -- infrastructure as code instead of a manual "add data source"
+# click-through, the same reasoning as versioned SQL migrations for the
+# schema.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

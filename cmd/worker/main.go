@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/vaibhavdangaich/orbit/internal/job"
+	"github.com/vaibhavdangaich/orbit/internal/metrics"
 	"github.com/vaibhavdangaich/orbit/internal/queue"
 	"github.com/vaibhavdangaich/orbit/internal/ratelimit"
 	"github.com/vaibhavdangaich/orbit/internal/store"
@@ -56,9 +57,19 @@ func main() {
 	kafkaGroup := envOr("ORBIT_KAFKA_GROUP", "orbit-workers")
 	redisAddr := envOr("ORBIT_REDIS_ADDR", ratelimit.DefaultDevAddr)
 	rateLimitPerTenant := envIntOr("ORBIT_RATE_LIMIT_PER_TENANT", 10)
+	metricsAddr := envOr("ORBIT_METRICS_ADDR", ":9102")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// A failed bind here is logged, not fatal -- running several worker
+	// replicas on one machine for a local demo means they'd all try this
+	// same default port unless given distinct ORBIT_METRICS_ADDR values,
+	// and a worker whose metrics port lost that race should still claim
+	// and execute jobs correctly. See internal/metrics.Serve's comment.
+	if err := metrics.Serve(metricsAddr); err != nil {
+		log.Printf("metrics: %v (continuing without a working /metrics endpoint)", err)
+	}
 
 	startupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	s, err := store.New(startupCtx, dsn)
@@ -172,6 +183,7 @@ func handleRunID(ctx context.Context, s *store.Store, limiter *ratelimit.Limiter
 		// doesn't stall behind one throttled tenant -- any other
 		// tenants' messages queued behind it keep flowing.
 		log.Printf("run %d: tenant %q rate-limited, deferring to sweep", runID, tenantID)
+		metrics.RunsRateLimited.Inc()
 		return
 	}
 
@@ -230,7 +242,10 @@ func runOne(ctx context.Context, s *store.Store, workerID string, r job.Run) {
 		return
 	}
 
+	start := time.Now()
 	execErr := execute(ctx, j.Payload)
+	metrics.ExecutionDuration.Observe(time.Since(start).Seconds())
+
 	if execErr == nil {
 		if err := s.CompleteRun(ctx, r.ID, workerID); err != nil && !errors.Is(err, store.ErrStale) {
 			log.Printf("run %d: complete: %v", r.ID, err)

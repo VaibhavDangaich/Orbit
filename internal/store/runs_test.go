@@ -8,7 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/vaibhavdangaich/orbit/internal/job"
+	"github.com/vaibhavdangaich/orbit/internal/metrics"
 )
 
 func mustCreateJob(t *testing.T, s *Store, nextRunAt time.Time) job.Job {
@@ -274,11 +277,11 @@ func TestReapExpiredLeases(t *testing.T) {
 
 	// A lease so short it's already expired by the time we check it --
 	// simulating a worker that claimed a run and then died.
-	runs, err := s.ClaimRuns(ctx, "worker-1", 1*time.Millisecond, 1)
+	runs, err := s.ClaimRuns(ctx, "worker-1", 20*time.Millisecond, 1)
 	if err != nil || len(runs) != 1 {
 		t.Fatalf("ClaimRuns: runs=%v err=%v", runs, err)
 	}
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
 	reaped, err := s.ReapExpiredLeases(ctx)
 	if err != nil {
@@ -430,11 +433,11 @@ func TestReapExpiredLeasesRetryWritesOutboxEntry(t *testing.T) {
 		t.Fatalf("DispatchOutbox: %v", err)
 	}
 
-	runs, err := s.ClaimRuns(ctx, "worker-1", 1*time.Millisecond, 1)
+	runs, err := s.ClaimRuns(ctx, "worker-1", 20*time.Millisecond, 1)
 	if err != nil || len(runs) != 1 {
 		t.Fatalf("ClaimRuns: runs=%v err=%v", runs, err)
 	}
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
 	reaped, err := s.ReapExpiredLeases(ctx)
 	if err != nil {
@@ -596,5 +599,38 @@ func TestDispatchOutboxLeavesRowUndispatchedOnPublishError(t *testing.T) {
 	after := undispatchedOutboxRunIDs(t, s, ctx)
 	if len(after) != 1 || after[0] != before[0] {
 		t.Fatalf("undispatched outbox rows after failed publish = %v, want unchanged %v", after, before)
+	}
+}
+
+// TestMetricsIncrementOnCompleteRun checks that instrumentation actually
+// fires, not just that it compiles. metrics.RunsCompleted is a
+// process-global counter shared by every test in this package (and, in a
+// real process, by every call the store package ever makes) -- reading it
+// before and after and asserting on the DELTA is what makes this safe to
+// run alongside every other test without caring what its absolute value
+// already is.
+func TestMetricsIncrementOnCompleteRun(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	mustCreateJob(t, s, now)
+	if _, err := s.MaterializeDueRuns(ctx, now, 10); err != nil {
+		t.Fatalf("MaterializeDueRuns: %v", err)
+	}
+	runs, err := s.ClaimRuns(ctx, "worker-1", 30*time.Second, 1)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("ClaimRuns: runs=%v err=%v", runs, err)
+	}
+
+	before := testutil.ToFloat64(metrics.RunsCompleted.WithLabelValues("succeeded"))
+
+	if err := s.CompleteRun(ctx, runs[0].ID, "worker-1"); err != nil {
+		t.Fatalf("CompleteRun: %v", err)
+	}
+
+	after := testutil.ToFloat64(metrics.RunsCompleted.WithLabelValues("succeeded"))
+	if after != before+1 {
+		t.Fatalf("RunsCompleted{status=succeeded} = %v, want %v (before) + 1", after, before)
 	}
 }

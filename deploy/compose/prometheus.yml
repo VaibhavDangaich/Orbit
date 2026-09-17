@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  # Our scheduler/worker binaries run as plain `go run`/compiled processes
+  # on the HOST, not as containers -- so Prometheus (which runs inside a
+  # container) can't reach them via "localhost", which from inside a
+  # container means the container itself. host.docker.internal is
+  # Docker's own hostname for "the machine running the containers", wired
+  # up below via extra_hosts so it also works on Linux Docker Engine, not
+  # just Docker Desktop (where it's automatic).
+  - job_name: orbit-scheduler
+    static_configs:
+      - targets: ["host.docker.internal:9101"]
+
+  - job_name: orbit-worker
+    static_configs:
+      - targets: ["host.docker.internal:9102"]

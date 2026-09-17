@@ -204,6 +204,7 @@ Every one of these is implemented and covered by a test that proves the property
 | **Partition-aware message routing** | `internal/queue/balancer.go` (`HashBalancer`) | A job's runs consistently land on the same Kafka partition (and, in steady state, the same worker) — verified live: 27/27 job-A firings via Kafka went to one worker, 28/28 job-B firings went to a different one, zero mixing. The single exception (1 job-A run landing on job-B's worker) came from the reconciliation sweep, which bypasses Kafka and therefore partition affinity entirely — expected, not a bug |
 | **Reconciliation as a safety net, not a religion** | `cmd/worker` (`sweepLoop`) | If the outbox/Kafka path is ever down, the original batch-poll claim path still finds the work |
 | **Per-tenant rate limiting without spending retries** | `internal/ratelimit` (Lua-scripted token bucket in Redis), `cmd/worker` (`handleRunID`) | An `EVAL`-atomic token bucket, checked before `ClaimRun` -- proven not to over-admit under concurrency in `TestAllowNoOverAdmitConcurrent`, the same "race for one slot" proof shape as `TestClaimRunsNoDoubleClaim`. A throttled run is deferred to `sweepLoop`, not routed through `FailRun`, so backpressure never spends one of the run's real `MaxAttempts` |
+| **Metrics as a cross-cutting exception to strict containment** | `internal/metrics` | Verified live: real Prometheus scrape of both binaries via `host.docker.internal`, real Grafana query through its own provisioned datasource proxy -- `orbit_runs_claimed_total{path="sweep"}` and `orbit_runs_completed_total{status="succeeded"}` both landed on the exact count of runs actually observed executing, not just a metric that compiles |
 
 ## Proven under real failure, not just designed for it
 
@@ -301,7 +302,7 @@ Zero mixing across dozens of firings — every job-A run went to worker 3, every
 Requires Docker and Go 1.26+.
 
 ```bash
-# 1. Start Postgres, etcd, Kafka, and Redis
+# 1. Start Postgres, etcd, Kafka, Redis, Prometheus, and Grafana
 docker compose -f deploy/compose/docker-compose.yml up -d
 
 # 2. Apply the schema
@@ -333,6 +334,30 @@ A single-screen, read-only view of live scheduler state — the `k9s`/`lazydocke
 
 `q` or `ctrl+c` quits. Like the other two binaries, it's configured entirely by `ORBIT_*` environment variables (`ORBIT_DATABASE_URL`, defaulting to `store.DefaultDevDSN` like everything else) — no flags, no config file, and it never writes to the database: no job creation or run cancellation from here, on purpose, the same "don't build it before there's a real need" restraint behind deferring a pluggable executor.
 
+## Observability
+
+`cmd/scheduler` and `cmd/worker` each expose a Prometheus `/metrics` endpoint (`internal/metrics`, the only package that imports `prometheus/client_golang` — same containment principle as store/election/queue/ratelimit for their infra dependencies). `deploy/compose` runs Prometheus (scraping both, via `host.docker.internal` since the binaries run on the host, not in a container) and Grafana, with Prometheus auto-provisioned as Grafana's datasource — no manual "add data source" click-through.
+
+```bash
+open http://localhost:9090   # Prometheus — raw queries, scrape target health
+open http://localhost:3001   # Grafana — Prometheus pre-wired as the default datasource
+```
+
+| Metric | Type | What it proves |
+|---|---|---|
+| `orbit_runs_materialized_total` | counter | Runs actually created by `MaterializeDueRuns` |
+| `orbit_schedule_misfires_total` | counter | Missed occurrences `FastForward` collapsed away — how far behind the scheduler has fallen |
+| `orbit_runs_dispatched_total` | counter | Successful Kafka publishes via the outbox |
+| `orbit_runs_claimed_total{path}` | counter | Claims by path (`kafka` vs `sweep`) — a live number for "reconciliation as a safety net," not just a claim in prose |
+| `orbit_runs_completed_total{status}` | counter | Outcomes by result (`succeeded` / `retried` / `failed`) |
+| `orbit_runs_rate_limited_total` | counter | Runs deferred because their tenant was over budget |
+| `orbit_leader_status` | gauge | 1 on whichever scheduler replica currently holds leadership, 0 elsewhere — scrape multiple replicas on distinct ports and a failover becomes visible as one line dropping while another rises |
+| `orbit_run_execution_duration_seconds` | histogram | Time spent in `execute()` — the raw material for the P50/P95/P99 numbers on the roadmap |
+
+**Verified live, not just wired up**: ran the real scheduler + worker against real Prometheus and Grafana, and every one of the numbers above came back correct and internally consistent — `orbit_runs_materialized_total` and `orbit_runs_dispatched_total` matched exactly, `orbit_runs_claimed_total{path="sweep"}` and `orbit_runs_completed_total{status="succeeded"}` both landed on the same count as the runs actually observed executing in the logs, and `orbit_run_execution_duration_seconds_count` was nonzero on the worker and correctly zero on the scheduler (execution only happens in one of them). That specific run happened to be claimed entirely by the reconciliation sweep rather than the Kafka path (a Kafka consumer-group join took longer than the sweep's next tick) — not a failure, exactly the scenario the sweep exists for, and now it's a real number instead of just a design claim. Queried Prometheus directly and through Grafana's own datasource proxy to confirm both paths return identical live data.
+
+Distributed tracing (OpenTelemetry, following one run's actual path across the scheduler → Kafka → worker boundary) is deliberately a separate, later phase — see Roadmap.
+
 ### Configuration
 
 All three binaries are configured entirely by environment variables (no config file, no flags) — the standard pattern for anything meant to run in a container.
@@ -350,6 +375,7 @@ All three binaries are configured entirely by environment variables (no config f
 | `ORBIT_ELECTION_TTL` | `10s` | Leader session TTL — the failover-speed/flapping-sensitivity tradeoff |
 | `ORBIT_KAFKA_BROKERS` | `localhost:19092` | Comma-separated Kafka brokers |
 | `ORBIT_KAFKA_PARTITIONS` | `3` | Partition count for topic creation |
+| `ORBIT_METRICS_ADDR` | `:9101` | Address the Prometheus `/metrics` endpoint binds to |
 
 **`cmd/worker`**
 
@@ -364,6 +390,7 @@ All three binaries are configured entirely by environment variables (no config f
 | `ORBIT_KAFKA_GROUP` | `orbit-workers` | Consumer group — all workers should share this |
 | `ORBIT_REDIS_ADDR` | `localhost:6380` | Redis address backing the per-tenant rate limiter |
 | `ORBIT_RATE_LIMIT_PER_TENANT` | `10` | Token bucket capacity and refill rate, in requests/sec, applied uniformly to every tenant |
+| `ORBIT_METRICS_ADDR` | `:9102` | Address the Prometheus `/metrics` endpoint binds to -- different default from `cmd/scheduler` so running one of each locally doesn't collide |
 
 **`cmd/tui`**
 
@@ -388,11 +415,12 @@ internal/
   queue/         the only package that knows Kafka exists
   hashring/      consistent hashing, standalone and fully tested on its own
   ratelimit/     the only package that knows Redis exists
+  metrics/       the only package that knows Prometheus's client library exists
 migrations/      versioned SQL, golang-migrate-compatible naming
-deploy/compose/  local dev infrastructure (Postgres, etcd, Kafka, Redis)
+deploy/compose/  local dev infrastructure (Postgres, etcd, Kafka, Redis, Prometheus, Grafana)
 ```
 
-Every `internal/` package is a hard boundary, not a convention: the Go compiler itself blocks any package outside this module from importing it. Each infra dependency (Postgres, etcd, Kafka, Redis) is contained to exactly one package that owns it; nothing else in the codebase imports a driver directly.
+Every `internal/` package is a hard boundary, not a convention: the Go compiler itself blocks any package outside this module from importing it. Each infra dependency (Postgres, etcd, Kafka, Redis, Prometheus) is contained to exactly one package that owns it; nothing else in the codebase imports a driver directly. `internal/metrics` is the one deliberate exception to "one package calls into another via a narrow interface, never a direct import" -- see its doc comment for why a metrics client is a different kind of dependency than a stateful connection pool.
 
 ## Design decisions worth knowing before an interview asks about them
 
@@ -419,7 +447,8 @@ Stated explicitly rather than glossed over:
 ## Roadmap
 
 - [x] Redis-backed per-tenant rate limiting
-- [ ] OpenTelemetry tracing + Prometheus/Grafana
+- [x] Prometheus metrics + Grafana (see "Observability" below)
+- [ ] OpenTelemetry distributed tracing across the scheduler → Kafka → worker boundary
 - [ ] Kubernetes deployment manifests
 - [ ] Load testing (k6) with published P50/P95/P99 numbers, plus chaos testing (kill -9 everything, prove no loss)
 - [x] A terminal dashboard (`bubbletea`) for live job/run/leader/worker visibility
