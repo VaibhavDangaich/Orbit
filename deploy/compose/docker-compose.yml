@@ -62,14 +62,25 @@ services:
       # can't satisfy both -- hence PLAINTEXT for host processes (TUI,
       # tests, `go run`) and K8S for pods reaching back out via
       # host.docker.internal, on two different ports.
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,K8S://:9094
+      #
+      # INTERNAL is the third "where": the scheduler/worker containers on
+      # this compose network. It is NOT redundant with PLAINTEXT, and
+      # reusing PLAINTEXT for them fails in a way worth understanding --
+      # the initial dial to kafka:9092 SUCCEEDS, so it looks configured
+      # correctly, and only the second hop breaks: creating a topic
+      # requires talking to the controller, the broker answers that
+      # request with PLAINTEXT's advertised address (localhost:19092),
+      # and localhost inside a container is that container itself.
+      # Hence "dial controller: connection refused" against a broker the
+      # client is demonstrably already connected to.
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,K8S://:9094,INTERNAL://:9095
       # Host 19092, not 9092: a machine-local Kafka install is already
       # bound to 9092/9093 on localhost -- the exact same class of
       # collision as the Postgres 5432 issue earlier, caught the same way
       # (checking `lsof` before assuming the default port is free).
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:19092,K8S://host.docker.internal:19094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:19092,K8S://host.docker.internal:19094,INTERNAL://kafka:9095
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,K8S:PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,K8S:PLAINTEXT,INTERNAL:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       # Single combined broker+controller process, "localhost" here
       # resolves inside the container's own network namespace (unlike our
@@ -213,8 +224,10 @@ services:
   # two-hop Kafka addressing problem documented on the kafka service, seen
   # from inside the network this time. Kafka's PLAINTEXT listener
   # advertises localhost:19092 for host clients, but a compose-internal
-  # client connects to kafka:9092 directly and never consults that
-  # advertised address for the initial dial.
+  # client uses the INTERNAL listener (kafka:9095), which advertises a
+  # name this network can resolve. kafka:9092 is NOT a working
+  # substitute -- see the INTERNAL note on the kafka service for why it
+  # connects successfully and then fails on the controller hop.
   #
   # No `ports:` on either service on purpose: that's what allows
   # `--scale scheduler=2 --scale worker=3`, since a fixed host port
@@ -230,7 +243,7 @@ services:
     environment:
       ORBIT_DATABASE_URL: postgres://scheduler:scheduler@postgres:5432/scheduler?sslmode=disable
       ORBIT_ETCD_ENDPOINTS: etcd:2379
-      ORBIT_KAFKA_BROKERS: kafka:9092
+      ORBIT_KAFKA_BROKERS: kafka:9095
       ORBIT_OTLP_ENDPOINT: jaeger:4317
     depends_on:
       migrate:
@@ -250,7 +263,7 @@ services:
       dockerfile: deploy/docker/worker.Dockerfile
     environment:
       ORBIT_DATABASE_URL: postgres://scheduler:scheduler@postgres:5432/scheduler?sslmode=disable
-      ORBIT_KAFKA_BROKERS: kafka:9092
+      ORBIT_KAFKA_BROKERS: kafka:9095
       ORBIT_REDIS_ADDR: redis:6379
       ORBIT_OTLP_ENDPOINT: jaeger:4317
     depends_on:
