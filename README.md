@@ -21,27 +21,27 @@ Define a job with a schedule (`@every 30s`) and a payload. `orbit` fires it on t
   'fontSize': '16px'
 }}}%%
 flowchart TB
-    subgraph COORD["🗳️  COORDINATION"]
+    subgraph COORD["COORDINATION"]
         direction LR
         ETCD[("etcd<br/>Raft consensus")]
     end
 
-    subgraph COMPUTE["⚙️  COMPUTE — N replicas each"]
+    subgraph COMPUTE["COMPUTE — N replicas each"]
         direction LR
-        SL["🔴 Scheduler<br/><b>LEADER</b>"]:::leader
-        SF1["⚪ Scheduler<br/>follower"]:::follower
-        SF2["⚪ Scheduler<br/>follower"]:::follower
-        W1["🔧 Worker 1"]:::worker
-        W2["🔧 Worker 2"]:::worker
-        W3["🔧 Worker 3"]:::worker
+        SL["Scheduler<br/><b>LEADER</b>"]:::leader
+        SF1["Scheduler<br/>follower"]:::follower
+        SF2["Scheduler<br/>follower"]:::follower
+        W1["Worker 1"]:::worker
+        W2["Worker 2"]:::worker
+        W3["Worker 3"]:::worker
     end
 
-    subgraph TRUTH["💾  SOURCE OF TRUTH"]
+    subgraph TRUTH["SOURCE OF TRUTH"]
         direction LR
         PG[("Postgres<br/>jobs · job_runs · outbox")]
     end
 
-    subgraph STREAM["📨  MESSAGE LAYER"]
+    subgraph STREAM["MESSAGE LAYER"]
         direction LR
         K{{"Kafka<br/>3 partitions"}}
     end
@@ -103,12 +103,12 @@ Only the scheduler drawn in red is actually doing anything at any given moment �
 }}}%%
 sequenceDiagram
     autonumber
-    participant J as 📋 jobs
-    participant S as ⚙️ Scheduler
-    participant O as 📤 outbox
-    participant K as 📨 Kafka
-    participant W as 🔧 Worker
-    participant R as 🗂️ job_runs
+    participant J as jobs
+    participant S as Scheduler
+    participant O as outbox
+    participant K as Kafka
+    participant W as Worker
+    participant R as job_runs
 
     rect rgb(13, 45, 74)
     Note over S,J: every poll_interval — only on the LEADER
@@ -242,21 +242,21 @@ sequenceDiagram
     participant B as Scheduler B
 
     A->>E: Campaign()
-    E-->>A: 🔴 elected leader
+    E-->>A: elected leader
     B->>E: Campaign() — blocks, waiting
 
     rect rgb(15, 64, 35)
-    Note over A,B: 🟢 Graceful shutdown — SIGTERM
+    Note over A,B: Graceful shutdown — SIGTERM
     A->>E: Resign()
-    E-->>B: 🔴 elected leader
+    E-->>B: elected leader
     Note over A,B: same second in the logs
     end
 
     rect rgb(74, 20, 20)
-    Note over A,B: 🔥 Crash — SIGKILL, no Resign()
+    Note over A,B: Crash — SIGKILL, no Resign()
     A--xE: keepalives stop
     Note over E: lease expires after ORBIT_ELECTION_TTL (3s in the demo)
-    E-->>B: 🔴 elected leader
+    E-->>B: elected leader
     Note over A,B: ~3.7s later — measured
     end
 ```
