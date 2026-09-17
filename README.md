@@ -10,34 +10,136 @@ Define a job with a schedule (`@every 30s`) and a payload. `orbit` fires it on t
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    subgraph COORD["🗳️  COORDINATION"]
+        direction LR
+        ETCD[("etcd<br/>Raft consensus")]
+    end
+
+    subgraph COMPUTE["⚙️  COMPUTE — N replicas each"]
+        direction LR
+        SL["🔴 Scheduler<br/><b>LEADER</b>"]:::leader
+        SF1["⚪ Scheduler<br/>follower"]:::follower
+        SF2["⚪ Scheduler<br/>follower"]:::follower
+        W1["🔧 Worker 1"]:::worker
+        W2["🔧 Worker 2"]:::worker
+        W3["🔧 Worker 3"]:::worker
+    end
+
+    subgraph TRUTH["💾  SOURCE OF TRUTH"]
+        direction LR
+        PG[("Postgres<br/>jobs · job_runs · outbox")]
+    end
+
+    subgraph STREAM["📨  MESSAGE LAYER"]
+        direction LR
+        K{{"Kafka<br/>3 partitions"}}
+    end
+
+    SL -. campaign / lease .-> ETCD
+    SF1 -. watching .-> ETCD
+    SF2 -. watching .-> ETCD
+
+    SL ==>|"materialize due runs, reap dead leases"| PG
+    PG ==>|"outbox rows"| SL
+    SL ==>|"dispatch, hash-partitioned by JobID"| K
+
+    K -. consumer group .-> W1
+    K -. consumer group .-> W2
+    K -. consumer group .-> W3
+
+    W1 ==>|"claim · fence · complete"| PG
+    W2 ==>|"claim · fence · complete"| PG
+    W3 ==>|"claim · fence · complete"| PG
+
+    classDef leader fill:#ff6b6b,stroke:#c92a2a,stroke-width:3px,color:#fff,font-weight:bold
+    classDef follower fill:#495057,stroke:#212529,color:#adb5bd
+    classDef worker fill:#4dabf7,stroke:#1864ab,color:#fff,font-weight:bold
+
+    style COORD fill:#fff3bf,stroke:#f08c00,stroke-width:2px
+    style COMPUTE fill:#e7f5ff,stroke:#1971c2,stroke-width:2px
+    style TRUTH fill:#d3f9d8,stroke:#2f9e44,stroke-width:2px
+    style STREAM fill:#ffe8cc,stroke:#e8590c,stroke-width:2px
 ```
-                    ┌─────────────┐
-                    │    etcd     │  leader election
-                    │ (KRaft-like │  (only 1 scheduler
-                    │  consensus) │   does work at a time)
-                    └──────┬──────┘
-                           │ campaign / lease
-                    ┌──────▼──────┐
-        ┌──────────▶│  scheduler  │◀──────────┐  (N replicas, 1 active)
-        │           │  (leader)   │           │
-        │           └──────┬──────┘           │
-        │                  │ materialize due   │
-        │                  │ runs, reap dead   │
-        │                  │ leases, dispatch  │
-        │                  ▼                   │
-   ┌────┴────┐      ┌─────────────┐            │
-   │ Postgres│◀────▶│   outbox    │───publish──▶│  Kafka
-   │(source  │      │ (atomic w/  │    (hash-   │ (3 partitions,
-   │of truth)│      │ the state   │  partitioned│  consumer group)
-   └────┬────┘      │  change)    │  by JobID)  │
-        │            └─────────────┘            │
-        │  claim / fence / complete             │
-        ▼                                       ▼
-   ┌─────────────────────────────────────────────────┐
-   │  worker (N replicas)                             │
-   │   • consumeLoop: primary path, via Kafka         │
-   │   • sweepLoop: periodic reconciliation safety net │
-   └───────────────────────────────────────────────────┘
+
+Only the scheduler drawn in red is actually doing anything at any given moment — the others are idle followers, watching etcd, ready to take over.
+
+## How a job runs, end to end
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant J as 📋 jobs
+    participant S as ⚙️ Scheduler
+    participant O as 📤 outbox
+    participant K as 📨 Kafka
+    participant W as 🔧 Worker
+    participant R as 🗂️ job_runs
+
+    rect rgb(231, 245, 255)
+    Note over S,J: every poll_interval — only on the LEADER
+    S->>J: SELECT due jobs FOR UPDATE SKIP LOCKED
+    S->>R: INSERT (job_id, scheduled_for) ON CONFLICT DO NOTHING
+    S->>O: INSERT outbox row
+    S->>J: UPDATE next_run_at
+    Note right of O: all four writes are ONE Postgres transaction
+    end
+
+    rect rgb(255, 243, 191)
+    S->>O: SELECT undispatched FOR UPDATE OF o SKIP LOCKED
+    S->>K: publish(run_id) — key = job_id, so it's always the same partition
+    S->>O: UPDATE dispatched_at = now()
+    end
+
+    rect rgb(211, 249, 216)
+    K-->>W: deliver (this worker owns the partition)
+    W->>R: UPDATE status='running' WHERE status='pending'
+    alt claimed successfully
+        W->>W: execute(payload)
+        alt succeeded
+            W->>R: UPDATE status='succeeded'
+        else failed, attempts remain
+            W->>R: UPDATE status='pending', attempt += 1
+            W->>O: INSERT outbox row — retry needs dispatching too
+        else failed, attempts exhausted
+            W->>R: UPDATE status='failed'
+        end
+    else already claimed — duplicate delivery
+        Note over W: harmless no-op, thanks to fencing
+    end
+    W->>K: commit offset
+    end
+```
+
+Blue = materialize, yellow = dispatch, green = claim-execute-report. Each zone is its own atomic step; nothing here needs a distributed transaction spanning Postgres and Kafka, because the outbox row is what makes the handoff between them safe.
+
+## Run lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: MaterializeDueRuns
+
+    pending --> running: ClaimRun / ClaimRuns<br/>(fenced by worker ID)
+
+    running --> succeeded: CompleteRun
+    running --> pending: FailRun<br/>attempt < MaxAttempts
+    running --> failed: FailRun<br/>attempt = MaxAttempts
+    running --> pending: lease expired, retriable
+    running --> failed: lease expired, exhausted
+
+    succeeded --> [*]
+    failed --> [*]
+
+    note right of running
+        claim_expires_at is the lease.
+        ReapExpiredLeases reclaims a run
+        whose worker died without ever
+        calling Complete/FailRun.
+    end note
+
+    classDef terminal fill:#495057,color:#fff
+    class succeeded,failed terminal
 ```
 
 ## System design concepts, and where they actually live
@@ -55,6 +157,64 @@ Every one of these is implemented and covered by a test that proves the property
 | **Consistent hashing** | `internal/hashring` | Adding a 6th node to a 5-node ring remaps ~16% of keys (measured), not the ~83% a naive `hash % N` would |
 | **Partition-aware message routing** | `internal/queue/balancer.go` (`HashBalancer`) | A job's runs consistently land on the same Kafka partition (and, in steady state, the same worker) — verified live: 27/27 job-A firings via Kafka went to one worker, 28/28 job-B firings went to a different one, zero mixing. The single exception (1 job-A run landing on job-B's worker) came from the reconciliation sweep, which bypasses Kafka and therefore partition affinity entirely — expected, not a bug |
 | **Reconciliation as a safety net, not a religion** | `cmd/worker` (`sweepLoop`) | If the outbox/Kafka path is ever down, the original batch-poll claim path still finds the work |
+
+## Proven under real failure, not just designed for it
+
+Every diagram above is the intended design. These two are what actually happened when the design was pushed against real infrastructure.
+
+**Leader failover — graceful vs. crash, side by side:**
+
+```mermaid
+sequenceDiagram
+    participant A as Scheduler A
+    participant E as etcd
+    participant B as Scheduler B
+
+    A->>E: Campaign()
+    E-->>A: 🔴 elected leader
+    B->>E: Campaign() — blocks, waiting
+
+    rect rgb(211, 249, 216)
+    Note over A,B: 🟢 Graceful shutdown — SIGTERM
+    A->>E: Resign()
+    E-->>B: 🔴 elected leader
+    Note over A,B: same second in the logs
+    end
+
+    rect rgb(255, 214, 214)
+    Note over A,B: 🔥 Crash — SIGKILL, no Resign()
+    A--xE: keepalives stop
+    Note over E: lease expires after ORBIT_ELECTION_TTL (3s in the demo)
+    E-->>B: 🔴 elected leader
+    Note over A,B: ~3.7s later — measured
+    end
+```
+
+A clean shutdown hands off in under a second because `Resign()` actively releases the election key. A hard crash costs the full TTL, because that's the only way etcd can tell the difference between "dead" and "just slow" — there's no free lunch, only a dial you get to choose.
+
+**Consistent hashing, holding up under a live 2-job, 3-worker run:**
+
+```mermaid
+flowchart LR
+    JA["Job A<br/><i>@every 1s</i>"]:::jobA
+    JB["Job B<br/><i>@every 1s</i>"]:::jobB
+
+    JA -->|"hash(JobID)"| P1(("Partition 1")):::hot
+    JB -->|"hash(JobID)"| P2(("Partition 2")):::hot
+    P0(("Partition 0")):::cold
+
+    P1 --> W3["Worker 3<br/><b>27 / 27 job-A runs</b>"]:::jobA
+    P2 --> W1["Worker 1<br/><b>28 / 28 job-B runs</b>"]:::jobB
+    P0 -.->|"no traffic this run"| W2["Worker 2<br/>idle"]:::idle
+
+    classDef jobA fill:#ff922b,stroke:#d9480f,color:#fff,font-weight:bold
+    classDef jobB fill:#7950f2,stroke:#5f3dc4,color:#fff,font-weight:bold
+    classDef hot fill:#ffd43b,stroke:#f08c00
+    classDef cold fill:#e9ecef,stroke:#adb5bd,color:#868e96
+    classDef idle fill:#f1f3f5,stroke:#ced4da,color:#adb5bd
+```
+
+Zero mixing across dozens of firings — every job-A run went to worker 3, every job-B run went to worker 1. Worker 2 sitting idle isn't a bug: with only 2 distinct job keys spread across 3 partitions, one partition getting no traffic is exactly what you'd expect. With real job/tenant cardinality this evens out on its own.
 
 ## Getting started
 
