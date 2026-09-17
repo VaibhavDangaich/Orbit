@@ -417,12 +417,35 @@ SIGKILL cannot be caught, so nothing resigns. The election key survives, still h
 
 That gap is not a bug to be tuned away; it's the price of detecting a death nobody announced, and it's the same trade every lease-based system makes. Lower the TTL and failover is faster but a brief etcd hiccup can evict a healthy leader; raise it and you survive network blips at the cost of a longer silent window.
 
-| | signal | resign? | time to next leader |
-|---|---|---|---|
-| `docker stop` | SIGTERM | yes, explicit `Resign()` | milliseconds |
-| `docker kill` | SIGKILL | no — process is simply gone | up to `ORBIT_ELECTION_TTL` (10s) |
+| | signal | resign? | time to next leader | measured |
+|---|---|---|---|---|
+| `docker stop` | SIGTERM | yes, explicit `Resign()` | bounded by an etcd round-trip | **499 µs** |
+| `docker kill` | SIGKILL | no — process is simply gone | up to `ORBIT_ELECTION_TTL` (10s) | **8.3 s** |
 
-Both services run with `restart: unless-stopped`, so the killed container comes back and rejoins as the new standby — the roles simply swap. (`docker stop` is a manual stop, so that one stays down until you start it again.)
+Those two numbers are from one sitting on a laptop, not a benchmark — but the ~16,000× gap between them is the entire point, and it's a property of the design rather than of the hardware. Raw logs, unedited:
+
+```
+# CRASH — no resign, the standby waits out a lease nobody released
+$ docker kill compose-scheduler-2                       # 23:31:04
+scheduler-1  2026-09-17T23:31:12.294151086Z  elected leader
+                                  └─ 8.3s after the kill
+
+# GRACEFUL — Resign() deletes the key, the standby is already blocked on it
+$ docker stop compose-scheduler-2
+scheduler-2  2026-09-17T23:33:19.452332381Z  resigned leadership
+scheduler-1  2026-09-17T23:33:19.452831173Z  elected leader
+                                  └─ 499µs after the resign
+```
+
+The crash number is the one that tells you something. It isn't latency that better code would remove: nobody told etcd the leader died, so the only way to find out is to wait for a lease nobody is renewing. Every lease-based system pays this, and the TTL is the dial — shorter means faster failover and a higher chance a brief etcd hiccup evicts a leader that was perfectly healthy.
+
+Neither container comes back on its own, and that surprised me enough to be worth writing down. Both services declare `restart: unless-stopped`, but Docker suppresses the restart policy for any container an operator stopped or killed by hand — `docker inspect` after a `docker kill` reports `RestartPolicy=unless-stopped`, `Status=exited`, `RestartCount=0`. The policy fires when the process dies on its own, not when you kill it from outside. So bring the old leader back yourself, and it rejoins as the standby:
+
+```bash
+docker start compose-scheduler-1
+```
+
+Worth knowing before you design a chaos test around it: "I killed the container and it healed" is not something `restart: unless-stopped` will give you, and on a distroless image there's no shell to `docker exec ... kill 1` with either.
 
 Jobs keep firing across both cases. Nothing is lost in the crash case either: `next_run_at` lives in Postgres, not in the dead scheduler's memory, so the incoming leader materialises whatever came due during the gap on its first tick.
 

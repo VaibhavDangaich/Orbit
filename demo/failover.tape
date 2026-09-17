@@ -4,12 +4,12 @@
 #   docker compose -f deploy/compose/docker-compose.yml --profile app up -d --build \
 #     --scale scheduler=2 --scale worker=3
 #
-# Order is crash-then-graceful, not the other way round, and that's
-# deliberate: each demo needs a live standby to promote. Killing first
-# leaves the killed container to restart (restart: unless-stopped) and
-# rejoin as the standby, which is exactly what the graceful demo then needs.
-# Doing it the other way would leave `docker stop` with nothing to hand
-# leadership to, since a stopped container stays stopped.
+# Order is crash-then-graceful, and the `docker start` between them is
+# NOT optional. `restart: unless-stopped` does not bring back a container
+# an operator killed -- Docker suppresses the restart policy for manual
+# stops and kills alike (verified: RestartCount stays 0 after docker
+# kill). Without that explicit restart, the crash demo leaves one
+# scheduler running and the graceful demo then has no standby to promote.
 
 Output docs/failover.gif
 
@@ -70,6 +70,14 @@ Sleep 15s
 Ctrl+C
 Sleep 2s
 
+Type "# The killed container does NOT come back on its own -- Docker ignores"
+Enter
+Type "# restart: unless-stopped for an operator kill. Bring it back as the standby:"
+Enter
+Type "docker start $(docker ps -aq --filter status=exited --filter name=compose-scheduler | head -1)"
+Enter
+Sleep 4s
+
 Type "clear"
 Enter
 Sleep 500ms
@@ -83,11 +91,12 @@ Type "docker stop $(./demo/leader.sh)"
 Enter
 Sleep 5s
 
-# 'stopped', not 'resign': a SUCCESSFUL Resign() logs nothing (scheduler
-# main.go only logs resign on error), so the outgoing leader's last line is
-# "stopped". Pairing it with the incoming leader's "elected leader"
-# timestamp is what shows the gap -- milliseconds here, vs ~10s above.
-Type "docker compose logs -t --since 20s scheduler | grep -E 'stopped|elected leader'"
+# The outgoing leader's "resigned leadership" next to the incoming one's
+# "elected leader" is the whole proof: same second, milliseconds apart,
+# versus the ~10s TTL gap above. 'stopped' stays in the pattern as a
+# fallback -- it's logged unconditionally on shutdown, so the demo still
+# shows the handoff even if the resign line isn't there.
+Type "docker compose logs -t --since 20s scheduler | grep -E 'resigned|stopped|elected leader'"
 Enter
 Sleep 5s
 
