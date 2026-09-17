@@ -88,16 +88,26 @@ func (s *Store) MaterializeDueRuns(ctx context.Context, now time.Time, limit int
 			log.Printf("job %d missed %d occurrence(s), firing once for %s", d.id, skipped, fireAt)
 		}
 
-		tag, err := tx.Exec(ctx, `
+		var newRunID job.RunID
+		err = tx.QueryRow(ctx, `
 			INSERT INTO job_runs (job_id, scheduled_for)
 			VALUES ($1, $2)
-			ON CONFLICT (job_id, scheduled_for) DO NOTHING`,
+			ON CONFLICT (job_id, scheduled_for) DO NOTHING
+			RETURNING id`,
 			d.id, fireAt,
-		)
-		if err != nil {
+		).Scan(&newRunID)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			// Already materialized by an earlier tick (or another
+			// scheduler instance) -- not an error, just nothing new to
+			// dispatch. next_run_at still needs to advance below
+			// regardless of which branch we took here.
+		case err != nil:
 			return created, fmt.Errorf("store: materialize: insert run for job %d: %w", d.id, err)
-		}
-		if tag.RowsAffected() > 0 {
+		default:
+			if _, err := tx.Exec(ctx, `INSERT INTO outbox (run_id) VALUES ($1)`, newRunID); err != nil {
+				return created, fmt.Errorf("store: materialize: outbox insert for run %d: %w", newRunID, err)
+			}
 			created++
 		}
 
@@ -117,10 +127,16 @@ func (s *Store) MaterializeDueRuns(ctx context.Context, now time.Time, limit int
 
 // ClaimRuns lets a worker check out up to limit pending runs, marking each
 // running under a lease that expires after `lease`. If the worker dies
-// before finishing, the lease eventually expires -- but reclaiming an
-// expired lease isn't implemented yet; that lands with FailRun in the next
-// step, since both need the same "has this run exhausted its retries"
-// check against the job's max_attempts.
+// before finishing, ReapExpiredLeases eventually reclaims it.
+//
+// This batch/poll-based claim is what cmd/worker used before the Kafka
+// migration; the Kafka consume path uses the single-run ClaimRun instead,
+// since Kafka already tells it exactly which run to work on. ClaimRuns
+// stays in use as cmd/worker's periodic reconciliation sweep -- a
+// deliberate second path to the same pending runs, not dead code: if the
+// outbox/Kafka path is ever down or drops a message, ClaimRuns is what
+// still finds and processes the run instead of it sitting unclaimed
+// forever.
 //
 // FOR UPDATE SKIP LOCKED is the entire safety mechanism here, and it's
 // worth being precise about what it does: every worker process runs this
@@ -232,9 +248,22 @@ func (s *Store) CompleteRun(ctx context.Context, runID job.RunID, workerID strin
 // violate the unique constraint, so retries must reuse the row). Otherwise
 // it becomes terminally 'failed'. The returned status tells the caller
 // which branch happened, for logging.
+//
+// When the run goes back to 'pending', this also writes an outbox row in
+// the SAME transaction -- without it, a retried run would be invisible to
+// the Kafka consume path: nothing else creates an outbox entry for a
+// retry, so no worker would ever be told this run is workable again, and
+// it would sit as 'pending' until cmd/worker's periodic ClaimRuns sweep
+// eventually found it (correct, just slow -- see ClaimRuns' doc comment).
 func (s *Store) FailRun(ctx context.Context, runID job.RunID, workerID string, errMsg string) (job.RunStatus, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("store: fail run %d: begin: %w", runID, err)
+	}
+	defer tx.Rollback(ctx)
+
 	var status job.RunStatus
-	err := s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		UPDATE job_runs AS jr
 		SET
 			status           = CASE WHEN jr.attempt < j.max_attempts THEN 'pending' ELSE 'failed' END,
@@ -255,6 +284,16 @@ func (s *Store) FailRun(ctx context.Context, runID job.RunID, workerID string, e
 	if err != nil {
 		return "", fmt.Errorf("store: fail run %d: %w", runID, err)
 	}
+
+	if status == job.RunPending {
+		if _, err := tx.Exec(ctx, `INSERT INTO outbox (run_id) VALUES ($1)`, runID); err != nil {
+			return "", fmt.Errorf("store: fail run %d: outbox insert: %w", runID, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("store: fail run %d: commit: %w", runID, err)
+	}
 	return status, nil
 }
 
@@ -267,11 +306,17 @@ func (s *Store) FailRun(ctx context.Context, runID job.RunID, workerID string, e
 // would otherwise sit at status='running' forever, since nothing would
 // ever call FailRun on its behalf. Nothing here is a new idea -- it's the
 // same CASE logic as FailRun, just triggered by a timeout instead of an
-// explicit report. In a running system this gets called on a timer
-// (alongside MaterializeDueRuns, once cmd/scheduler exists) rather than
-// on demand.
+// explicit report, and it writes the same kind of outbox row FailRun does
+// for whichever reaped runs went back to 'pending' (not the ones that hit
+// terminal 'failed' -- nothing needs to dispatch those).
 func (s *Store) ReapExpiredLeases(ctx context.Context) (int, error) {
-	tag, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("store: reap expired leases: begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, `
 		UPDATE job_runs AS jr
 		SET
 			status           = CASE WHEN jr.attempt < j.max_attempts THEN 'pending' ELSE 'failed' END,
@@ -282,10 +327,144 @@ func (s *Store) ReapExpiredLeases(ctx context.Context) (int, error) {
 			finished_at      = CASE WHEN jr.attempt < j.max_attempts THEN NULL ELSE now() END,
 			error            = 'lease expired: worker did not report completion'
 		FROM jobs AS j
-		WHERE jr.status = 'running' AND jr.claim_expires_at < now() AND j.id = jr.job_id`,
+		WHERE jr.status = 'running' AND jr.claim_expires_at < now() AND j.id = jr.job_id
+		RETURNING jr.id, jr.status`,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("store: reap expired leases: %w", err)
 	}
-	return int(tag.RowsAffected()), nil
+
+	var reaped int
+	var retriedIDs []job.RunID
+	for rows.Next() {
+		var id job.RunID
+		var status job.RunStatus
+		if err := rows.Scan(&id, &status); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("store: reap expired leases: scan: %w", err)
+		}
+		reaped++
+		if status == job.RunPending {
+			retriedIDs = append(retriedIDs, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("store: reap expired leases: rows: %w", err)
+	}
+	rows.Close()
+
+	for _, id := range retriedIDs {
+		if _, err := tx.Exec(ctx, `INSERT INTO outbox (run_id) VALUES ($1)`, id); err != nil {
+			return 0, fmt.Errorf("store: reap expired leases: outbox insert for run %d: %w", id, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("store: reap expired leases: commit: %w", err)
+	}
+	return reaped, nil
+}
+
+// ClaimRun claims one SPECIFIC run by ID, for the Kafka consume path --
+// unlike ClaimRuns' batch scan, which discovers candidates by polling,
+// the caller here already knows exactly which run to work on because
+// Kafka told it.
+//
+// ok=false means the run wasn't claimable: either another worker already
+// has it, or it already finished. Both are ordinary outcomes here, not
+// errors -- a duplicate Kafka delivery (expected under at-least-once
+// delivery) looks exactly like "someone already handled this," and the
+// caller's correct response in either case is the same: commit the Kafka
+// offset and move on, nothing left to do for this message.
+func (s *Store) ClaimRun(ctx context.Context, runID job.RunID, workerID string, lease time.Duration) (job.Run, bool, error) {
+	expiresAt := time.Now().Add(lease)
+	var r job.Run
+	err := s.pool.QueryRow(ctx, `
+		UPDATE job_runs
+		SET status = 'running', claimed_by = $1, claim_expires_at = $2, started_at = now()
+		WHERE id = $3 AND status = 'pending'
+		RETURNING id, job_id, scheduled_for, attempt`,
+		workerID, expiresAt, runID,
+	).Scan(&r.ID, &r.JobID, &r.ScheduledFor, &r.Attempt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return job.Run{}, false, nil
+	}
+	if err != nil {
+		return job.Run{}, false, fmt.Errorf("store: claim run %d: %w", runID, err)
+	}
+	r.Status = job.RunRunning
+	r.ClaimedBy = &workerID
+	r.ClaimExpiresAt = &expiresAt
+	return r, true, nil
+}
+
+// DispatchOutbox drains up to limit undispatched outbox rows, calling
+// publish for each and marking it dispatched on success.
+//
+// publish is a plain function, not an interface -- this package never
+// imports internal/queue (or anything Kafka-specific) at all; the caller
+// (cmd/scheduler) passes queue.Publisher.Publish in directly. A one-method
+// interface would say the same thing with more ceremony; Go's http.
+// HandlerFunc is the standard-library example of this same idiom.
+//
+// If publish fails partway through a batch, the whole transaction rolls
+// back -- including the dispatched_at marks already written for earlier
+// rows in this same batch. Those get republished on the next call. That's
+// a duplicate publish, not a bug: the outbox pattern is only ever "at
+// least once," and ClaimRun's fencing (WHERE status = 'pending') is what
+// makes a duplicate harmless downstream. See migrations/0002_outbox.up.sql
+// for the fuller version of this argument.
+func (s *Store) DispatchOutbox(ctx context.Context, limit int, publish func(context.Context, job.RunID) error) (int, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("store: dispatch outbox: begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, `
+		SELECT id, run_id
+		FROM outbox
+		WHERE dispatched_at IS NULL
+		ORDER BY id
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED`,
+		limit,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("store: dispatch outbox: select: %w", err)
+	}
+
+	type outboxRow struct {
+		id    int64
+		runID job.RunID
+	}
+	var pending []outboxRow
+	for rows.Next() {
+		var r outboxRow
+		if err := rows.Scan(&r.id, &r.runID); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("store: dispatch outbox: scan: %w", err)
+		}
+		pending = append(pending, r)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("store: dispatch outbox: rows: %w", err)
+	}
+	rows.Close()
+
+	dispatched := 0
+	for _, r := range pending {
+		if err := publish(ctx, r.runID); err != nil {
+			return dispatched, fmt.Errorf("store: dispatch outbox: publish run %d: %w", r.runID, err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE outbox SET dispatched_at = now() WHERE id = $1`, r.id); err != nil {
+			return dispatched, fmt.Errorf("store: dispatch outbox: mark run %d dispatched: %w", r.runID, err)
+		}
+		dispatched++
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return dispatched, fmt.Errorf("store: dispatch outbox: commit: %w", err)
+	}
+	return dispatched, nil
 }

@@ -324,3 +324,225 @@ func TestReapExpiredLeasesIgnoresActiveLeases(t *testing.T) {
 		t.Fatalf("reaped = %d, want 0 (lease still active)", reaped)
 	}
 }
+
+// undispatchedOutboxRunIDs is a test helper reaching directly into the
+// outbox table -- there's no public store method to list outbox rows
+// (nothing outside DispatchOutbox needs one), so the test queries it
+// itself, same as the status/claimed_by checks in TestReapExpiredLeases.
+func undispatchedOutboxRunIDs(t *testing.T, s *Store, ctx context.Context) []job.RunID {
+	t.Helper()
+	rows, err := s.pool.Query(ctx, `SELECT run_id FROM outbox WHERE dispatched_at IS NULL ORDER BY run_id`)
+	if err != nil {
+		t.Fatalf("query outbox: %v", err)
+	}
+	defer rows.Close()
+
+	var ids []job.RunID
+	for rows.Next() {
+		var id job.RunID
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan outbox row: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func TestMaterializeDueRunsWritesOutboxEntry(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	mustCreateJob(t, s, now)
+	if _, err := s.MaterializeDueRuns(ctx, now, 10); err != nil {
+		t.Fatalf("MaterializeDueRuns: %v", err)
+	}
+
+	ids := undispatchedOutboxRunIDs(t, s, ctx)
+	if len(ids) != 1 {
+		t.Fatalf("undispatched outbox rows = %d, want 1 (got %v)", len(ids), ids)
+	}
+
+	// A second call at the same `now` hits the ON CONFLICT DO NOTHING
+	// branch (already materialized) -- it must NOT write a second outbox
+	// row for the same run.
+	if _, err := s.MaterializeDueRuns(ctx, now, 10); err != nil {
+		t.Fatalf("MaterializeDueRuns (second call): %v", err)
+	}
+	ids = undispatchedOutboxRunIDs(t, s, ctx)
+	if len(ids) != 1 {
+		t.Fatalf("undispatched outbox rows after second call = %d, want still 1 (got %v)", len(ids), ids)
+	}
+}
+
+func TestFailRunRetryWritesOutboxEntry(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	mustCreateJob(t, s, now) // MaxAttempts=3, so one failure still retries
+	if _, err := s.MaterializeDueRuns(ctx, now, 10); err != nil {
+		t.Fatalf("MaterializeDueRuns: %v", err)
+	}
+
+	// Consume the materialize-time outbox row first (ClaimRuns itself
+	// doesn't touch the outbox at all -- it's the batch reconciliation
+	// path, entirely independent of Kafka). Without this, "after" below
+	// would see TWO undispatched rows for the same run_id: the original,
+	// still-undispatched materialize row, plus a new one from the retry --
+	// which is a real, accepted possibility in production (a harmless
+	// duplicate publish later), just not what this test is isolating.
+	if _, err := s.DispatchOutbox(ctx, 10, func(context.Context, job.RunID) error { return nil }); err != nil {
+		t.Fatalf("DispatchOutbox: %v", err)
+	}
+
+	runs, err := s.ClaimRuns(ctx, "worker-1", 30*time.Second, 1)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("ClaimRuns: runs=%v err=%v", runs, err)
+	}
+
+	status, err := s.FailRun(ctx, runs[0].ID, "worker-1", "boom")
+	if err != nil {
+		t.Fatalf("FailRun: %v", err)
+	}
+	if status != job.RunPending {
+		t.Fatalf("status = %q, want %q", status, job.RunPending)
+	}
+
+	after := undispatchedOutboxRunIDs(t, s, ctx)
+	if len(after) != 1 || after[0] != runs[0].ID {
+		t.Fatalf("undispatched outbox rows after retry = %v, want [%d]", after, runs[0].ID)
+	}
+}
+
+func TestReapExpiredLeasesRetryWritesOutboxEntry(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	mustCreateJob(t, s, now)
+	if _, err := s.MaterializeDueRuns(ctx, now, 10); err != nil {
+		t.Fatalf("MaterializeDueRuns: %v", err)
+	}
+	// Consume the materialize-time outbox row first -- see the comment in
+	// TestFailRunRetryWritesOutboxEntry for why.
+	if _, err := s.DispatchOutbox(ctx, 10, func(context.Context, job.RunID) error { return nil }); err != nil {
+		t.Fatalf("DispatchOutbox: %v", err)
+	}
+
+	runs, err := s.ClaimRuns(ctx, "worker-1", 1*time.Millisecond, 1)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("ClaimRuns: runs=%v err=%v", runs, err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	reaped, err := s.ReapExpiredLeases(ctx)
+	if err != nil {
+		t.Fatalf("ReapExpiredLeases: %v", err)
+	}
+	if reaped != 1 {
+		t.Fatalf("reaped = %d, want 1", reaped)
+	}
+
+	ids := undispatchedOutboxRunIDs(t, s, ctx)
+	if len(ids) != 1 || ids[0] != runs[0].ID {
+		t.Fatalf("undispatched outbox rows = %v, want [%d]", ids, runs[0].ID)
+	}
+}
+
+func TestClaimRun(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	mustCreateJob(t, s, now)
+	if _, err := s.MaterializeDueRuns(ctx, now, 10); err != nil {
+		t.Fatalf("MaterializeDueRuns: %v", err)
+	}
+	ids := undispatchedOutboxRunIDs(t, s, ctx)
+	if len(ids) != 1 {
+		t.Fatalf("expected exactly one pending run, got outbox rows %v", ids)
+	}
+	runID := ids[0]
+
+	r, ok, err := s.ClaimRun(ctx, runID, "worker-1", 30*time.Second)
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	if !ok {
+		t.Fatal("ClaimRun: ok = false, want true")
+	}
+	if r.ID != runID || r.Status != job.RunRunning {
+		t.Fatalf("claimed run = %+v, want ID=%d Status=%q", r, runID, job.RunRunning)
+	}
+
+	// A duplicate delivery of the same run_id (the exact scenario Kafka's
+	// at-least-once guarantee makes routine) must NOT succeed a second
+	// time -- the run is already 'running', not 'pending'.
+	_, ok, err = s.ClaimRun(ctx, runID, "worker-2", 30*time.Second)
+	if err != nil {
+		t.Fatalf("ClaimRun (duplicate): %v", err)
+	}
+	if ok {
+		t.Fatal("ClaimRun (duplicate): ok = true, want false")
+	}
+}
+
+func TestDispatchOutbox(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	mustCreateJob(t, s, now)
+	if _, err := s.MaterializeDueRuns(ctx, now, 10); err != nil {
+		t.Fatalf("MaterializeDueRuns: %v", err)
+	}
+
+	var published []job.RunID
+	dispatched, err := s.DispatchOutbox(ctx, 10, func(_ context.Context, runID job.RunID) error {
+		published = append(published, runID)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("DispatchOutbox: %v", err)
+	}
+	if dispatched != 1 || len(published) != 1 {
+		t.Fatalf("dispatched = %d, published = %v, want 1 and one call", dispatched, published)
+	}
+
+	// Already-dispatched rows must not be handed out again.
+	ids := undispatchedOutboxRunIDs(t, s, ctx)
+	if len(ids) != 0 {
+		t.Fatalf("undispatched outbox rows after dispatch = %v, want none", ids)
+	}
+}
+
+func TestDispatchOutboxLeavesRowUndispatchedOnPublishError(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	mustCreateJob(t, s, now)
+	if _, err := s.MaterializeDueRuns(ctx, now, 10); err != nil {
+		t.Fatalf("MaterializeDueRuns: %v", err)
+	}
+
+	before := undispatchedOutboxRunIDs(t, s, ctx)
+	if len(before) != 1 {
+		t.Fatalf("undispatched outbox rows before = %v, want 1", before)
+	}
+
+	_, err := s.DispatchOutbox(ctx, 10, func(_ context.Context, _ job.RunID) error {
+		return fmt.Errorf("broker unreachable")
+	})
+	if err == nil {
+		t.Fatal("DispatchOutbox: expected an error, got nil")
+	}
+
+	// The row must still be there to retry -- a failed publish must not
+	// silently consume the outbox entry.
+	after := undispatchedOutboxRunIDs(t, s, ctx)
+	if len(after) != 1 || after[0] != before[0] {
+		t.Fatalf("undispatched outbox rows after failed publish = %v, want unchanged %v", after, before)
+	}
+}

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/vaibhavdangaich/orbit/internal/election"
+	"github.com/vaibhavdangaich/orbit/internal/queue"
 	"github.com/vaibhavdangaich/orbit/internal/store"
 )
 
@@ -35,6 +36,8 @@ func main() {
 	etcdEndpoints := strings.Split(envOr("ORBIT_ETCD_ENDPOINTS", "localhost:2379"), ",")
 	electionKey := envOr("ORBIT_ELECTION_KEY", "/orbit/scheduler-leader/")
 	electionTTL := envDurationOr("ORBIT_ELECTION_TTL", 10*time.Second)
+	kafkaBrokers := strings.Split(envOr("ORBIT_KAFKA_BROKERS", strings.Join(queue.DefaultDevBrokers, ",")), ",")
+	kafkaPartitions := envIntOr("ORBIT_KAFKA_PARTITIONS", 3)
 
 	// signal.NotifyContext returns a context that's cancelled the moment
 	// this process receives SIGINT (Ctrl+C) or SIGTERM (what `docker stop`
@@ -62,15 +65,32 @@ func main() {
 	}
 	defer el.Close()
 
-	log.Printf("started: poll_interval=%s batch_size=%d election_ttl=%s", pollInterval, batchSize, electionTTL)
-	runWithLeaderElection(ctx, el, nodeID, s, pollInterval, batchSize)
+	// EnsureTopic runs on every startup, not as a one-time manual step --
+	// idempotent infrastructure setup that happens to live in code instead
+	// of a runbook. Partition count matters for the demo: a topic
+	// created with the default single partition would mean only ONE
+	// worker in a consumer group ever gets messages, no matter how many
+	// workers are running -- Kafka partitions, not consumer count, are
+	// the unit of parallelism.
+	topicCtx, topicCancel := context.WithTimeout(ctx, 10*time.Second)
+	err = queue.EnsureTopic(topicCtx, kafkaBrokers, kafkaPartitions)
+	topicCancel()
+	if err != nil {
+		log.Fatalf("ensure kafka topic: %v", err)
+	}
+
+	publisher := queue.NewPublisher(kafkaBrokers)
+	defer publisher.Close()
+
+	log.Printf("started: poll_interval=%s batch_size=%d election_ttl=%s kafka_partitions=%d", pollInterval, batchSize, electionTTL, kafkaPartitions)
+	runWithLeaderElection(ctx, el, nodeID, s, publisher, pollInterval, batchSize)
 	log.Printf("stopped")
 }
 
 // runWithLeaderElection blocks as a follower until this process wins the
 // leadership campaign, runs the tick loop for as long as it holds
 // leadership, and returns once the process is shutting down.
-func runWithLeaderElection(ctx context.Context, el *election.Election, nodeID string, s *store.Store, pollInterval time.Duration, batchSize int) {
+func runWithLeaderElection(ctx context.Context, el *election.Election, nodeID string, s *store.Store, publisher *queue.Publisher, pollInterval time.Duration, batchSize int) {
 	log.Printf("campaigning for leadership")
 	if err := el.Campaign(ctx, nodeID); err != nil {
 		if ctx.Err() != nil {
@@ -94,7 +114,7 @@ func runWithLeaderElection(ctx context.Context, el *election.Election, nodeID st
 		}
 	}()
 
-	run(leaderCtx, s, pollInterval, batchSize)
+	run(leaderCtx, s, publisher, pollInterval, batchSize)
 
 	if ctx.Err() != nil {
 		// Real shutdown: resign cleanly instead of just disappearing, so
@@ -129,7 +149,7 @@ func defaultNodeID() string {
 // run is the actual loop, pulled out of main so it's callable without a
 // real process -- not exercised by a test yet, but this is the shape that
 // makes it possible to add one later without restructuring anything.
-func run(ctx context.Context, s *store.Store, pollInterval time.Duration, batchSize int) {
+func run(ctx context.Context, s *store.Store, publisher *queue.Publisher, pollInterval time.Duration, batchSize int) {
 	// time.Ticker delivers a tick on a channel every pollInterval, which
 	// is what lets this loop wait on EITHER a tick OR shutdown at the same
 	// time via select -- a plain time.Sleep(pollInterval) loop would block
@@ -142,12 +162,12 @@ func run(ctx context.Context, s *store.Store, pollInterval time.Duration, batchS
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			tick(ctx, s, batchSize)
+			tick(ctx, s, publisher, batchSize)
 		}
 	}
 }
 
-func tick(ctx context.Context, s *store.Store, batchSize int) {
+func tick(ctx context.Context, s *store.Store, publisher *queue.Publisher, batchSize int) {
 	created, err := s.MaterializeDueRuns(ctx, time.Now().UTC(), batchSize)
 	if err != nil {
 		log.Printf("materialize due runs: %v", err)
@@ -160,6 +180,13 @@ func tick(ctx context.Context, s *store.Store, batchSize int) {
 		log.Printf("reap expired leases: %v", err)
 	} else if reaped > 0 {
 		log.Printf("reaped %d expired lease(s)", reaped)
+	}
+
+	dispatched, err := s.DispatchOutbox(ctx, batchSize, publisher.Publish)
+	if err != nil {
+		log.Printf("dispatch outbox: %v", err)
+	} else if dispatched > 0 {
+		log.Printf("dispatched %d run(s) to kafka", dispatched)
 	}
 }
 

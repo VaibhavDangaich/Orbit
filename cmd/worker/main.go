@@ -1,8 +1,20 @@
-// cmd/worker claims pending Runs and executes them. Any number of these
-// can run at once, against the same Postgres, with zero coordination
-// between them -- that's what internal/store's FOR UPDATE SKIP LOCKED
-// claim query buys us. Try it: run two of these in separate terminals
-// pointed at the same database and watch them split the work.
+// cmd/worker executes Runs. It has two independent paths to the same
+// work, running as two goroutines in every worker process:
+//
+//   - consumeLoop: the primary path. Consumes "run ready" messages from
+//     Kafka as part of a consumer group -- Kafka's partition assignment
+//     is what replaces the old manual SKIP LOCKED polling as the
+//     mechanism spreading work across however many workers are running.
+//   - sweepLoop: a slow (default 30s) reconciliation pass using
+//     store.ClaimRuns, the original batch SKIP LOCKED scan from before
+//     Kafka existed. If the outbox/Kafka path is ever down, or drops a
+//     message, this is what still finds and processes the run -- instead
+//     of it sitting unclaimed forever. Not a fallback that only matters
+//     in theory: it's the same code this worker used exclusively before
+//     this step, now demoted to a safety net instead of deleted.
+//
+// Any number of these can run at once, against the same Postgres and
+// Kafka consumer group, with zero coordination between them.
 package main
 
 import (
@@ -13,10 +25,13 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/vaibhavdangaich/orbit/internal/job"
+	"github.com/vaibhavdangaich/orbit/internal/queue"
 	"github.com/vaibhavdangaich/orbit/internal/store"
 )
 
@@ -25,9 +40,11 @@ func main() {
 	log.SetPrefix(fmt.Sprintf("[worker %s] ", workerID))
 
 	dsn := envOr("ORBIT_DATABASE_URL", store.DefaultDevDSN)
-	pollInterval := envDurationOr("ORBIT_POLL_INTERVAL", 2*time.Second)
 	lease := envDurationOr("ORBIT_LEASE", 30*time.Second)
-	batchSize := envIntOr("ORBIT_BATCH_SIZE", 10)
+	sweepInterval := envDurationOr("ORBIT_SWEEP_INTERVAL", 30*time.Second)
+	sweepBatchSize := envIntOr("ORBIT_BATCH_SIZE", 10)
+	kafkaBrokers := strings.Split(envOr("ORBIT_KAFKA_BROKERS", strings.Join(queue.DefaultDevBrokers, ",")), ",")
+	kafkaGroup := envOr("ORBIT_KAFKA_GROUP", "orbit-workers")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -40,13 +57,82 @@ func main() {
 	}
 	defer s.Close()
 
-	log.Printf("started: poll_interval=%s lease=%s batch_size=%d", pollInterval, lease, batchSize)
-	run(ctx, s, workerID, pollInterval, lease, batchSize)
+	consumer := queue.NewConsumer(kafkaBrokers, kafkaGroup)
+	defer consumer.Close()
+
+	log.Printf("started: lease=%s sweep_interval=%s kafka_group=%s", lease, sweepInterval, kafkaGroup)
+
+	// Two independent loops, one process. `var wg sync.WaitGroup` is a
+	// counter: wg.Add(1) before each goroutine starts, wg.Done() when it
+	// exits, wg.Wait() blocks until that count hits zero. Both loops
+	// share ctx, so the same SIGTERM that cancels one cancels both --
+	// wg.Wait() is just what lets main() know they've actually finished
+	// cleaning up before the process exits, instead of exiting out from
+	// under them.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		consumeLoop(ctx, s, consumer, workerID, lease)
+	}()
+	go func() {
+		defer wg.Done()
+		sweepLoop(ctx, s, workerID, lease, sweepInterval, sweepBatchSize)
+	}()
+	wg.Wait()
+
 	log.Printf("stopped")
 }
 
-func run(ctx context.Context, s *store.Store, workerID string, pollInterval, lease time.Duration, batchSize int) {
-	ticker := time.NewTicker(pollInterval)
+// consumeLoop is the primary path: block on the next Kafka message, claim
+// the specific run it names, execute it, report the outcome, then commit
+// the offset -- in that order, so a crash between fetch and commit means
+// Kafka redelivers the message rather than silently losing it.
+func consumeLoop(ctx context.Context, s *store.Store, consumer *queue.Consumer, workerID string, lease time.Duration) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		runID, commit, err := consumer.Next(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("consume: %v", err)
+			continue
+		}
+
+		handleRunID(ctx, s, workerID, lease, runID)
+
+		if err := commit(ctx); err != nil {
+			log.Printf("run %d: commit kafka offset: %v", runID, err)
+		}
+	}
+}
+
+func handleRunID(ctx context.Context, s *store.Store, workerID string, lease time.Duration, runID job.RunID) {
+	r, ok, err := s.ClaimRun(ctx, runID, workerID, lease)
+	if err != nil {
+		log.Printf("run %d: claim: %v", runID, err)
+		return
+	}
+	if !ok {
+		// Not an error -- a duplicate Kafka delivery (expected under
+		// at-least-once) or the sweep already got to it first look
+		// identical from here: someone already has (or finished) this
+		// run, so there's nothing left for this message to do.
+		log.Printf("run %d: already claimed or finished, skipping", runID)
+		return
+	}
+	runOne(ctx, s, workerID, r)
+}
+
+// sweepLoop is the reconciliation path: periodically claim whatever's
+// still pending via the batch SKIP LOCKED scan, same as every worker did
+// before Kafka existed.
+func sweepLoop(ctx context.Context, s *store.Store, workerID string, lease, interval time.Duration, batchSize int) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -54,30 +140,27 @@ func run(ctx context.Context, s *store.Store, workerID string, pollInterval, lea
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			tick(ctx, s, workerID, lease, batchSize)
+			runs, err := s.ClaimRuns(ctx, workerID, lease, batchSize)
+			if err != nil {
+				log.Printf("sweep: claim runs: %v", err)
+				continue
+			}
+			if len(runs) > 0 {
+				log.Printf("sweep: claimed %d run(s) the kafka path missed", len(runs))
+			}
+			for _, r := range runs {
+				runOne(ctx, s, workerID, r)
+			}
 		}
 	}
 }
 
-func tick(ctx context.Context, s *store.Store, workerID string, lease time.Duration, batchSize int) {
-	runs, err := s.ClaimRuns(ctx, workerID, lease, batchSize)
-	if err != nil {
-		log.Printf("claim runs: %v", err)
-		return
-	}
-
-	for _, r := range runs {
-		runOne(ctx, s, workerID, r)
-	}
-}
-
 func runOne(ctx context.Context, s *store.Store, workerID string, r job.Run) {
-	// A real Payload isn't in hand yet -- ClaimRuns returns job_runs
+	// A real Payload isn't in hand yet -- ClaimRun(s) returns job_runs
 	// columns only, not the parent job's payload. Fetching it here with a
 	// second query is the simplest correct thing to do today; if this
-	// join shows up as a hot path later (batch_size climbing into the
-	// thousands), it's the kind of thing an index or a JOIN in ClaimRuns
-	// itself would fix.
+	// join shows up as a hot path later, it's the kind of thing a JOIN in
+	// the claim query itself would fix.
 	j, err := s.GetJob(ctx, r.JobID)
 	if err != nil {
 		log.Printf("run %d: load job %d: %v", r.ID, r.JobID, err)
