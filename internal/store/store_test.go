@@ -10,10 +10,6 @@ import (
 	"github.com/vaibhavdangaich/orbit/internal/job"
 )
 
-// defaultTestDSN matches deploy/compose/docker-compose.yml. Override with
-// ORBIT_TEST_DATABASE_URL if you're running Postgres somewhere else.
-const defaultTestDSN = "postgres://scheduler:scheduler@localhost:5433/scheduler?sslmode=disable"
-
 // newTestStore is a small test helper -- unexported, lives only in _test.go
 // files, and never ships in the built binary. This is Go's version of a
 // Jest beforeEach/test fixture, just written as a plain function.
@@ -22,7 +18,7 @@ func newTestStore(t *testing.T) *Store {
 
 	dsn := os.Getenv("ORBIT_TEST_DATABASE_URL")
 	if dsn == "" {
-		dsn = defaultTestDSN
+		dsn = DefaultDevDSN
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

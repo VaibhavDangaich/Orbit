@@ -24,6 +24,15 @@ type Store struct {
 	pool *pgxpool.Pool
 }
 
+// DefaultDevDSN matches deploy/compose/docker-compose.yml. It's the single
+// source of truth for local-dev connection details -- cmd/scheduler,
+// cmd/worker, and the store's own tests all fall back to this if
+// ORBIT_DATABASE_URL / ORBIT_TEST_DATABASE_URL isn't set. Duplicating this
+// string in three places is exactly how we ended up debugging a port
+// mismatch earlier (localhost:5432 colliding with a native Postgres
+// install) -- one constant instead means a future port change can't drift.
+const DefaultDevDSN = "postgres://scheduler:scheduler@localhost:5433/scheduler?sslmode=disable"
+
 // New opens a connection pool to Postgres and verifies it's reachable.
 //
 // A pool, not a single connection: opening a fresh TCP connection plus
