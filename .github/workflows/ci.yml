@@ -1,0 +1,148 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch cancels the first run still in flight --
+# nothing here depends on every commit getting a run, and a queued-up
+# backlog of stale runs is just slower feedback on the commit that matters.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # The real dependencies, as real containers -- not mocks. Every
+    # *_test.go in this repo calls t.Skipf when its backing service is
+    # unreachable, which keeps `go test ./...` usable on a laptop with
+    # nothing running, but means a CI job without these services would go
+    # GREEN while silently testing almost nothing. The preflight step
+    # below is what turns that failure mode from invisible into loud.
+    #
+    # Host ports deliberately match deploy/compose/docker-compose.yml
+    # (5433 / 6380 / 19092), so store.DefaultDevDSN, ratelimit.
+    # DefaultDevAddr and queue.DefaultDevBrokers resolve here exactly as
+    # they do locally -- no ORBIT_TEST_* overrides needed, and a drifting
+    # default breaks CI loudly instead of quietly testing a stale address.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: scheduler
+          POSTGRES_PASSWORD: scheduler
+          POSTGRES_DB: scheduler
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U scheduler -d scheduler"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
+      kafka:
+        # Same image and KRaft setup as deploy/compose/docker-compose.yml,
+        # minus the K8S listener -- nothing in CI reaches Kafka from
+        # inside another container, so the host-facing listener is the
+        # only one needed. Advertised as localhost:19092 because the job
+        # itself runs on the runner VM, not in a container, so the
+        # service's mapped host port IS the address tests dial.
+        image: apache/kafka:3.8.0
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:19092
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+          CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+        ports:
+          - 19092:9092
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Read the version from go.mod rather than pinning it twice --
+          # one place to bump, and CI can never drift from what the module
+          # actually declares.
+          go-version-file: go.mod
+          cache: true
+
+      # ponytail: a port check, not a protocol handshake -- it proves the
+      # service container published its port, not that it speaks its
+      # protocol. That's enough to catch the failure this guards against
+      # (services absent -> every integration test t.Skipf's -> green CI
+      # that tested nothing), and the service healthchecks above already
+      # cover protocol liveness. Upgrade to a real client ping if a
+      # service ever starts publishing its port before it can serve.
+      - name: Preflight — fail loudly if a dependency is missing
+        run: |
+          for hostport in localhost:5433 localhost:6380 localhost:19092; do
+            host=${hostport%:*}; port=${hostport#*:}
+            timeout 60 bash -c "until (echo > /dev/tcp/$host/$port) 2>/dev/null; do sleep 1; done" \
+              || { echo "::error::$hostport never came up — integration tests would have silently skipped"; exit 1; }
+            echo "ok: $hostport"
+          done
+
+      # The test suite assumes its tables already exist (store_test.go
+      # TRUNCATEs them in its fixture), and nothing in the app applies
+      # migrations at startup. psql ships on the GitHub runner image, so
+      # applying the versioned SQL directly costs nothing -- no
+      # golang-migrate binary to install for two idempotent files.
+      - name: Apply migrations
+        env:
+          PGPASSWORD: scheduler
+        run: |
+          for f in migrations/*.up.sql; do
+            echo "applying $f"
+            psql -h localhost -p 5433 -U scheduler -d scheduler -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: go vet
+        run: go vet ./...
+
+      # -race matters more than usual here: this repo's whole point is
+      # concurrent claiming, leader election and a worker pool. A data
+      # race in that code is the exact class of bug that passes a
+      # single-threaded test run and fails in production.
+      - name: go test
+        run: go test -race -count=1 ./...
+
+  # Separate job, not a step: it needs no service containers and nothing
+  # in it depends on the tests passing, so it runs in parallel and a
+  # broken Dockerfile is reported at the same time as a broken test
+  # rather than after it.
+  build-images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build scheduler image
+        run: docker build -f deploy/docker/scheduler.Dockerfile -t orbit-scheduler:ci .
+
+      - name: Build worker image
+        run: docker build -f deploy/docker/worker.Dockerfile -t orbit-worker:ci .
