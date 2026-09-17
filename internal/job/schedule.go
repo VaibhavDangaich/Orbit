@@ -52,6 +52,35 @@ func (s Schedule) NextRun(last time.Time) time.Time {
 	return last.Add(s.every)
 }
 
+// FastForward answers "this job was due at dueAt, and it's now `now` --
+// what should actually happen?" It exists for one reason: if the
+// scheduler was offline for an hour and a job fires every 30s, waking up
+// and firing 120 queued-up runs would be wrong, not thorough. Real
+// schedulers (Kubernetes CronJob included) collapse a missed window into
+// a single fire for the most recent due occurrence and drop the rest.
+//
+// dueAt must already be <= now -- callers only call this once they've
+// confirmed the job is due; FastForward doesn't re-check that itself.
+//
+// Returns:
+//   - fireAt: the single occurrence to actually run (the most recent one
+//     at or before now)
+//   - next: the following occurrence, strictly after now -- becomes the
+//     job's new NextRunAt
+//   - skipped: how many occurrences were superseded and never fired,
+//     for logging/metrics -- a non-zero value means the scheduler fell
+//     behind and is worth alerting on
+func (s Schedule) FastForward(dueAt, now time.Time) (fireAt, next time.Time, skipped int) {
+	fireAt = dueAt
+	next = s.NextRun(fireAt)
+	for !next.After(now) {
+		fireAt = next
+		next = s.NextRun(fireAt)
+		skipped++
+	}
+	return fireAt, next, skipped
+}
+
 // String implements fmt.Stringer so Schedule prints nicely in logs.
 func (s Schedule) String() string {
 	return s.spec

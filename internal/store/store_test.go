@@ -34,6 +34,18 @@ func newTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(s.Close)
 
+	// Postgres here is a real, persistent container -- it survives across
+	// every `go test` invocation, not just every test within one run. So
+	// without this, a run's leftover rows are still there the next time
+	// you run `go test`, and tests that scan "all due jobs" or "all
+	// pending runs" silently pick up other tests' data. TRUNCATE before
+	// each test gives every test a guaranteed-empty table to start from.
+	// RESTART IDENTITY also resets the bigserial counters, so IDs are
+	// small and predictable in test failure output.
+	if _, err := s.pool.Exec(ctx, "TRUNCATE TABLE job_runs, jobs RESTART IDENTITY CASCADE"); err != nil {
+		t.Fatalf("truncate tables: %v", err)
+	}
+
 	return s
 }
 

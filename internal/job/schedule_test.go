@@ -43,3 +43,61 @@ func TestScheduleNextRun(t *testing.T) {
 		t.Fatalf("NextRun() = %v, want %v", got, want)
 	}
 }
+
+func TestScheduleFastForward(t *testing.T) {
+	sched, err := ParseSchedule("@every 30s")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	t0 := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name        string
+		dueAt       time.Time
+		now         time.Time
+		wantFireAt  time.Time
+		wantNext    time.Time
+		wantSkipped int
+	}{
+		{
+			name:        "on time, no misfire",
+			dueAt:       t0,
+			now:         t0,
+			wantFireAt:  t0,
+			wantNext:    t0.Add(30 * time.Second),
+			wantSkipped: 0,
+		},
+		{
+			name:        "one period missed",
+			dueAt:       t0,
+			now:         t0.Add(45 * time.Second),
+			wantFireAt:  t0.Add(30 * time.Second),
+			wantNext:    t0.Add(60 * time.Second),
+			wantSkipped: 1,
+		},
+		{
+			name:        "long outage, ten periods missed",
+			dueAt:       t0,
+			now:         t0.Add(300 * time.Second),
+			wantFireAt:  t0.Add(300 * time.Second),
+			wantNext:    t0.Add(330 * time.Second),
+			wantSkipped: 10,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fireAt, next, skipped := sched.FastForward(tt.dueAt, tt.now)
+			if !fireAt.Equal(tt.wantFireAt) {
+				t.Errorf("fireAt = %v, want %v", fireAt, tt.wantFireAt)
+			}
+			if !next.Equal(tt.wantNext) {
+				t.Errorf("next = %v, want %v", next, tt.wantNext)
+			}
+			if skipped != tt.wantSkipped {
+				t.Errorf("skipped = %d, want %d", skipped, tt.wantSkipped)
+			}
+		})
+	}
+}
