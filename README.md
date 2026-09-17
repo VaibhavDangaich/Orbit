@@ -386,6 +386,10 @@ Don't mix the two: an `app`-profile scheduler and a `go run` scheduler will both
 
 ## Watch it fail over
 
+![leader failover: crash vs. graceful](docs/failover.gif)
+
+Both halves of that recording are real, unedited and reproducible — `demo/failover-demo.sh` is the script it runs.
+
 The single most load-bearing claim in this README is that killing the active scheduler doesn't stop jobs from firing. Here's how to make that happen on your own machine in about a minute — and, more usefully, how to see that **the two ways of killing it behave differently**, which is where the interesting engineering actually is.
 
 Start two schedulers and find the leader:
@@ -419,23 +423,25 @@ That gap is not a bug to be tuned away; it's the price of detecting a death nobo
 
 | | signal | resign? | time to next leader | measured |
 |---|---|---|---|---|
-| `docker stop` | SIGTERM | yes, explicit `Resign()` | bounded by an etcd round-trip | **499 µs** |
-| `docker kill` | SIGKILL | no — process is simply gone | up to `ORBIT_ELECTION_TTL` (10s) | **8.3 s** |
+| `docker stop` | SIGTERM | yes, explicit `Resign()` | bounded by an etcd round-trip | **290 µs** |
+| `docker kill` | SIGKILL | no — process is simply gone | up to `ORBIT_ELECTION_TTL` (10s) | **8.6 s** |
 
-Those two numbers are from one sitting on a laptop, not a benchmark — but the ~16,000× gap between them is the entire point, and it's a property of the design rather than of the hardware. Raw logs, unedited:
+Those are from one sitting on a laptop, not a benchmark — but the ~30,000× gap between them is the entire point, and it comes from the design rather than the hardware. The exact log lines behind the recording above:
 
 ```
-# CRASH — no resign, the standby waits out a lease nobody released
-$ docker kill compose-scheduler-2                       # 23:31:04
-scheduler-1  2026-09-17T23:31:12.294151086Z  elected leader
-                                  └─ 8.3s after the kill
+# CRASH — no resign, so the standby waits out a lease nobody released
+$ docker kill compose-scheduler-1                        # killed at 23:38:42
+scheduler-2  2026-09-17T23:38:50.582107465Z  elected leader
+                                  └─ 8.6s after the kill
 
-# GRACEFUL — Resign() deletes the key, the standby is already blocked on it
+# GRACEFUL — Resign() deletes the key, and the standby is already blocked on it
 $ docker stop compose-scheduler-2
-scheduler-2  2026-09-17T23:33:19.452332381Z  resigned leadership
-scheduler-1  2026-09-17T23:33:19.452831173Z  elected leader
-                                  └─ 499µs after the resign
+scheduler-2  2026-09-17T23:39:01.959640429Z  resigned leadership
+scheduler-1  2026-09-17T23:39:01.959930220Z  elected leader
+                                  └─ 290µs after the resign
 ```
+
+Through both events, the workers logged 22 executions of a 5-second job without a gap.
 
 The crash number is the one that tells you something. It isn't latency that better code would remove: nobody told etcd the leader died, so the only way to find out is to wait for a lease nobody is renewing. Every lease-based system pays this, and the TTL is the dial — shorter means faster failover and a higher chance a brief etcd hiccup evicts a leader that was perfectly healthy.
 
