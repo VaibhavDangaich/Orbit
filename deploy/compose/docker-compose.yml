@@ -275,10 +275,16 @@ services:
         condition: service_healthy
       jaeger:
         condition: service_started
-    # restart: unless-stopped is what makes the crash-recovery demo
-    # honest -- a killed worker comes back and re-claims, rather than
-    # staying dead and making lease expiry look like the only recovery
-    # path. The scheduler gets it for the same reason on failover.
+    # Covers a process that dies on its own -- a panic, an OOM kill, a
+    # dependency it can't survive losing -- and brings it back to re-claim
+    # its share of the work.
+    #
+    # It does NOT cover `docker kill` or `docker stop`. Docker suppresses
+    # the restart policy for anything an operator ended by hand, so after
+    # `docker kill` the container stays down with RestartCount=0. The
+    # failover demo has to `docker start` the killed container explicitly
+    # for exactly this reason -- see demo/failover-demo.sh, which prints
+    # the `docker inspect` output that proves it rather than asserting it.
     restart: unless-stopped
 
 volumes:
