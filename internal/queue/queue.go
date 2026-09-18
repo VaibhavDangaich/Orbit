@@ -182,6 +182,29 @@ func NewConsumer(brokers []string, groupID, topic string) *Consumer {
 			Brokers: brokers,
 			GroupID: groupID,
 			Topic:   topic,
+			// Explicit, not inherited from kafka-go's zero-value defaults
+			// -- same values the library already falls back to, stated
+			// here so the intended behavior is reviewable instead of
+			// requiring a trip into the dependency's source to confirm.
+			//
+			// FirstOffset: a group with no committed offset (brand new,
+			// or reading a fresh topic) starts from the beginning, not
+			// the tail -- required for at-least-once delivery, since a
+			// message published moments before this reader's first
+			// rebalance completes must still be seen, not skipped.
+			StartOffset: kafka.FirstOffset,
+			// 10s / 100ms / 1s: how long a single fetch blocks waiting
+			// for a message before returning empty, and the retry
+			// backoff bounds when a fetch comes back empty. Left at the
+			// library's own defaults -- this project's flakiness with a
+			// COLD consumer group (see queue_test.go's TestPublishConsumeRoundTrip
+			// comment) is in the group-join/rebalance path, not this fetch loop,
+			// so there's no evidence yet that tuning these actually
+			// helps; changing them without that evidence would just
+			// trade one unexplained number for another.
+			MaxWait:        10 * time.Second,
+			ReadBackoffMin: 100 * time.Millisecond,
+			ReadBackoffMax: 1 * time.Second,
 		}),
 	}
 }
