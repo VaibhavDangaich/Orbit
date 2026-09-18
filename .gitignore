@@ -1,2 +1,13 @@
 # Claude Code local session/agent state -- machine-specific, not project source.
 .claude/
+
+# `go build ./cmd/<name>` with no -o writes a binary named after the
+# package to the CURRENT directory -- easy to do by habit from the repo
+# root, and each name below matches a real cmd/ subdirectory, so accept
+# the (small) risk of a same-named top-level dir over the real cost of
+# accidentally committing a 20+MB binary again.
+/scheduler
+/worker
+/api
+/tui
+/loadtest

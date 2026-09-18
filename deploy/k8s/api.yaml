@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orbit-api
+  namespace: orbit
+spec:
+  # 2, not N-for-a-leader-standby-split like the scheduler: this service
+  # has no leadership concept at all -- every replica independently
+  # accepts requests and calls the same store.CreateJob/GetJob/ListJobs
+  # every other replica does, with Postgres's own constraints (not
+  # coordination between API replicas) doing the safety work, same as
+  # cmd/worker's replicas already do for execution.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: orbit-api
+  template:
+    metadata:
+      labels:
+        app: orbit-api
+    spec:
+      containers:
+        - name: api
+          image: orbit-api:dev
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: orbit-config
+            - secretRef:
+                name: orbit-db-credentials
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9103
+          # Same split as scheduler.yaml/worker.yaml: /healthz checks
+          # nothing but itself, /readyz pings Postgres -- the one
+          # dependency this service can't do anything useful without.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orbit-api
+  namespace: orbit
+  labels:
+    app: orbit-api
+spec:
+  selector:
+    app: orbit-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: metrics
+      port: 9103
+      targetPort: metrics

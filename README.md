@@ -211,6 +211,7 @@ Every one of these is implemented and covered by a test that proves the property
 | **Two independent self-healing mechanisms composing correctly** | `deploy/k8s/scheduler.yaml` (2 replicas, `PodDisruptionBudget`) | etcd's election and Kubernetes' own reconciliation loop solve *different* failure modes and don't know about each other -- verified live on a real `kind` cluster: deleting the leader pod triggered a graceful `Resign`, the etcd-elected standby took over in ~2s, and, independently, the Deployment controller replaced the deleted pod to restore replica count |
 | **Real load testing surfaces real bugs** | `cmd/loadtest`, `internal/queue.NewPublisher` (`BatchTimeout`) | A load test isn't a formality: seeding 1000 jobs found kafka-go's default 1-second producer linger silently serializing every dispatch -- a one-line fix produced a ~9x throughput improvement, with before/after P50/P95/P99 numbers to show it, not just a claim that it's "fast" |
 | **"Kill -9 everything" as a literal test plan, not a slogan** | `deploy/compose` (Kafka outage), any running scheduler/worker (SIGKILL) | Three real process/infra kills -- a worker mid-execution, the leader mid-burst, the message broker mid-workload -- each checked against seeded-vs-terminal-count, scoped to the test's own tenant: zero loss, every time. The worker-kill scenario goes one step further, grepping a distinct per-job token out of every worker's log to confirm `execute()` itself, not just the database row, ran exactly once |
+| **A real write path, not a widened test surface** | `cmd/api` | Create/get/list over plain `net/http`, ending in the exact same `internal/store` calls every other binary already used -- verified live end to end: a job created over HTTP, materialized by a real scheduler, dispatched over Kafka, and executed by a real worker, 7 consecutive successful firings with zero failures |
 
 ## Proven under real failure, not just designed for it
 
@@ -352,14 +353,13 @@ A single terminal `status` row is bookkeeping, not proof `execute()` itself only
 ### Run the whole system — Docker only, no Go toolchain
 
 ```bash
-# Infrastructure, schema migrations, 2 schedulers and 3 workers, in one command
+# Infrastructure, schema migrations, 2 schedulers, 3 workers, and the API, in one command
 docker compose -f deploy/compose/docker-compose.yml --profile app up -d --build \
   --scale scheduler=2 --scale worker=3
 
-# Seed a job (there's no API yet -- see Roadmap)
-docker exec -i compose-postgres-1 psql -U scheduler -d scheduler -c \
-  "INSERT INTO jobs (tenant_id, name, schedule, payload, enabled, max_attempts, next_run_at) \
-   VALUES ('demo', 'hello', '@every 10s', '{\"message\":\"hello from orbit\"}', true, 3, now());"
+# Seed a job over real HTTP -- see "API" below for the full contract
+curl -s -X POST http://localhost:8080/jobs -H "Content-Type: application/json" -d \
+  '{"tenant_id":"demo","name":"hello","schedule":"@every 10s","payload":{"message":"hello from orbit"}}'
 
 # Watch it work
 docker compose -f deploy/compose/docker-compose.yml logs -f scheduler worker
@@ -380,11 +380,36 @@ docker compose -f deploy/compose/docker-compose.yml up -d
 
 go run ./cmd/scheduler
 go run ./cmd/worker
+go run ./cmd/api
 ```
 
 Run a second `go run ./cmd/worker` in another terminal and watch work split across both. Run a second `go run ./cmd/scheduler` and only one will log "elected leader" — kill it and watch the other take over.
 
 Don't mix the two: an `app`-profile scheduler and a `go run` scheduler will both join the same election, which is legal but makes it much harder to tell which process you're actually watching.
+
+## API
+
+`cmd/api` is the only write path into the `jobs` table that isn't raw SQL — every earlier phase of this project ran against jobs inserted by hand via `psql`, correct for development, not something a real system hands its users. It owns no scheduling or execution logic; every request ends in exactly the same `internal/store.CreateJob`/`GetJob`/`ListJobs` calls the rest of the system already had, over plain `net/http` with Go 1.22's pattern-matching `ServeMux` — no router library, nothing this project didn't already need.
+
+| Method & path | What it does |
+|---|---|
+| `POST /jobs` | Create a job. Body: `tenant_id`, `name`, `schedule` (required), `payload`, `enabled`, `max_attempts` (optional). Returns `201` with the created job, or `400` on a bad schedule string, missing required field, or malformed JSON. |
+| `GET /jobs/{id}` | Fetch one job by ID. `404` if it doesn't exist. |
+| `GET /jobs` | List jobs, most recent `limit` (default 50, max 500). |
+
+```bash
+curl -s -X POST http://localhost:8080/jobs -H "Content-Type: application/json" -d \
+  '{"tenant_id":"acme","name":"nightly-report","schedule":"@every 1h","payload":{"message":"hi"}}'
+```
+
+Two deliberate design choices, not oversights:
+
+- **`NextRunAt` is computed server-side, not accepted from the caller.** A job's first run is one schedule interval after it's created (`Schedule.NextRun`'s own doc comment: "the job's creation time, if it has never run"), not immediately — letting a client set this directly would mean two callers using the same schedule string could get inconsistent first-fire semantics for no reason.
+- **The list endpoint has its own response type (`jobSummaryResponse`), not `store.JobSummary` marshaled directly.** `JobSummary` carries no JSON tags (its only other caller, `cmd/tui`, never serializes it) — marshaling it as-is would silently emit Go field names (`"TenantID"`) instead of the snake_case every other endpoint uses (`"tenant_id"`), a real bug this project's own tests caught before it shipped, not something `go vet` or the compiler would ever flag.
+
+**Verified live, not just unit-tested**: ran a real scheduler + worker + api together, created a job over HTTP with a 5-second schedule, and watched `job_runs` directly in Postgres — 7 consecutive `succeeded` executions, zero failures, claimed by a real worker pod, proving a job created through this new HTTP surface flows through the exact same materialize → dispatch → claim → execute pipeline every other phase of this project already proved, not a parallel code path that merely looks connected.
+
+**Known gap, stated plainly**: no update, delete, or pause endpoint, and no authentication — a job, once created, can only be watched, not managed, and anyone who can reach the port can create one. Both are real next steps, not built here because create/get/list was enough to close the actual gap ("there's no way to submit a job without raw SQL") this phase existed to fix.
 
 ## Watch it fail over
 
@@ -550,6 +575,15 @@ The Kafka column is the one that bites. `kafka:9092` looks like the obvious comp
 | `ORBIT_METRICS_ADDR` | `:9102` | Address the Prometheus `/metrics` endpoint binds to -- different default from `cmd/scheduler` so running one of each locally doesn't collide |
 | `ORBIT_OTLP_ENDPOINT` | `localhost:4317` | Jaeger's OTLP/gRPC receiver address |
 
+**`cmd/api`**
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ORBIT_DATABASE_URL` | local dev Postgres | Postgres connection string |
+| `ORBIT_API_ADDR` | `:8080` | Address the HTTP API binds to |
+| `ORBIT_METRICS_ADDR` | `:9103` | Address the Prometheus `/metrics` endpoint (and `/healthz`/`/readyz`) binds to |
+| `ORBIT_OTLP_ENDPOINT` | `localhost:4317` | Jaeger's OTLP/gRPC receiver address |
+
 **`cmd/tui`**
 
 | Variable | Default | Meaning |
@@ -561,7 +595,7 @@ The Kafka column is the one that bites. `kafka:9092` looks like the obvious comp
 
 ## Kubernetes
 
-`deploy/k8s` has real Deployment/Service/ConfigMap/Secret/PodDisruptionBudget/HorizontalPodAutoscaler manifests for `cmd/scheduler` and `cmd/worker` — not a re-packaging of `deploy/compose`'s infra as YAML. Postgres/etcd/Kafka/Redis/Jaeger stay where `deploy/compose` already runs them; in a real deployment those would be managed services (RDS, MSK, ElastiCache) or installed from the Helm charts their own maintainers publish, not hand-rolled StatefulSets duplicating what a real team wouldn't build either. `deploy/docker/{scheduler,worker}.Dockerfile` are multi-stage builds onto `gcr.io/distroless/static-debian12` — no shell, no package manager, nothing for a CVE scanner to flag but the binary's own dependencies.
+`deploy/k8s` has real Deployment/Service/ConfigMap/Secret/PodDisruptionBudget/HorizontalPodAutoscaler manifests for `cmd/scheduler`, `cmd/worker`, and `cmd/api` — not a re-packaging of `deploy/compose`'s infra as YAML. Postgres/etcd/Kafka/Redis/Jaeger stay where `deploy/compose` already runs them; in a real deployment those would be managed services (RDS, MSK, ElastiCache) or installed from the Helm charts their own maintainers publish, not hand-rolled StatefulSets duplicating what a real team wouldn't build either. `deploy/docker/{scheduler,worker,api}.Dockerfile` are multi-stage builds onto `gcr.io/distroless/static-debian12` — no shell, no package manager, nothing for a CVE scanner to flag but the binary's own dependencies.
 
 ```bash
 kind create cluster --name orbit
@@ -587,6 +621,7 @@ Verified by breaking it rather than by reading it: with Postgres frozen (`docker
 cmd/
   scheduler/     leader-elected loop: materialize due runs, reap dead leases, dispatch to Kafka
   worker/        claims + executes runs, via Kafka (primary) and a periodic sweep (safety net)
+  api/           HTTP create/get/list for jobs -- the only write path into `jobs` that isn't raw SQL
   tui/           bubbletea dashboard: read-only, live job/run-status view (internal/store/dashboard.go)
   loadtest/      seeds a burst of jobs, waits for completion, reports P50/P95/P99 latency by segment
 internal/
@@ -600,8 +635,8 @@ internal/
   tracing/       the only package that knows the OpenTelemetry SDK exists
 migrations/      versioned SQL, golang-migrate-compatible naming
 deploy/compose/  local dev infrastructure (Postgres, etcd, Kafka, Redis, Prometheus, Grafana, Jaeger)
-deploy/docker/   multi-stage Dockerfiles for cmd/scheduler and cmd/worker
-deploy/k8s/      Deployment/Service/ConfigMap/Secret/PDB/HPA manifests for cmd/scheduler and cmd/worker
+deploy/docker/   multi-stage Dockerfiles for cmd/scheduler, cmd/worker, and cmd/api
+deploy/k8s/      Deployment/Service/ConfigMap/Secret/PDB/HPA manifests for cmd/scheduler, cmd/worker, and cmd/api
 ```
 
 Every `internal/` package is a hard boundary, not a convention: the Go compiler itself blocks any package outside this module from importing it. Each infra dependency (Postgres, etcd, Kafka, Redis, Prometheus) is contained to exactly one package that owns it; nothing else in the codebase imports a driver directly. `internal/metrics` is the one deliberate exception to "one package calls into another via a narrow interface, never a direct import" -- see its doc comment for why a metrics client is a different kind of dependency than a stateful connection pool.
@@ -618,7 +653,7 @@ Every `internal/` package is a hard boundary, not a convention: the Go compiler 
 
 Stated explicitly rather than glossed over:
 
-- **No API yet** — jobs are inserted directly via SQL. A `cmd/api` service is the natural next step.
+- **`cmd/api` has no update, delete, pause, or auth** — see "API" above. Create/get/list closes the actual gap (no way to submit a job without raw SQL); job management and access control are real next steps, deliberately not built speculatively ahead of a need.
 - **`cmd/worker` has a per-run N+1 query** (`GetJob` after every claim, to fetch the payload) — fine at current batch sizes, a known candidate for folding into the claim query itself if it ever becomes a hot path.
 - **No pluggable executor** — `cmd/worker/execute.go` is a single function, not an `Executor` interface with a registry, because there's exactly one kind of job so far. Building the abstraction before a second kind exists would be solving a problem this system doesn't have yet.
 - **Rate limiting is global-shape, not per-tenant configurable** — `ORBIT_RATE_LIMIT_PER_TENANT` sets one requests/sec ceiling applied uniformly to every tenant's own bucket. A database-backed, per-tenant-configurable limit is the natural next step once real tenant traffic makes that a genuine need, not before.

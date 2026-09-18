@@ -38,9 +38,11 @@ func newTestStore(t *testing.T) *Store {
 	// each test gives every test a guaranteed-empty table to start from.
 	// RESTART IDENTITY also resets the bigserial counters, so IDs are
 	// small and predictable in test failure output.
-	if _, err := s.pool.Exec(ctx, "TRUNCATE TABLE job_runs, jobs RESTART IDENTITY CASCADE"); err != nil {
+	unlock, err := s.TruncateForTest(ctx)
+	if err != nil {
 		t.Fatalf("truncate tables: %v", err)
 	}
+	t.Cleanup(unlock)
 
 	return s
 }

@@ -287,6 +287,38 @@ services:
     # the `docker inspect` output that proves it rather than asserting it.
     restart: unless-stopped
 
+  # No ORBIT_KAFKA_BROKERS/ORBIT_ETCD_ENDPOINTS here -- this service
+  # never imports internal/queue or internal/election, only
+  # internal/store, so it has nothing to configure for either.
+  #
+  # Unlike scheduler/worker, this one DOES map a host port. Those two are
+  # meant to be scaled (`--scale worker=3`) with Prometheus reaching them
+  # over the compose network -- a fixed host port mapping can't be shared
+  # across replicas. The API is the opposite case: its whole purpose is
+  # to be reachable from OUTSIDE the compose network (a developer's own
+  # curl, in this demo), so it needs exactly the fixed port a scaled
+  # service can't have. That's also why it isn't part of the
+  # `--scale ... ` example in the README -- fronting multiple replicas
+  # behind one host port needs a real load balancer, which is
+  # legitimate production infrastructure this compose file was never
+  # trying to reproduce.
+  api:
+    profiles: [app]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/api.Dockerfile
+    environment:
+      ORBIT_DATABASE_URL: postgres://scheduler:scheduler@postgres:5432/scheduler?sslmode=disable
+      ORBIT_OTLP_ENDPOINT: jaeger:4317
+    ports:
+      - "8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      jaeger:
+        condition: service_started
+    restart: unless-stopped
+
 volumes:
   pgdata:
   etcddata:

@@ -6,3 +6,4 @@ resources:
   - secret.yaml
   - scheduler.yaml
   - worker.yaml
+  - api.yaml

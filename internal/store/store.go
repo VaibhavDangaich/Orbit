@@ -92,3 +92,55 @@ func (s *Store) Close() {
 func (s *Store) Ping(ctx context.Context) error {
 	return s.pool.Ping(ctx)
 }
+
+// testLockKey is the arbitrary, fixed key every caller of TruncateForTest
+// agrees on -- Postgres advisory locks are keyed by a plain int64, no
+// registry involved, just "use the same number."
+const testLockKey = 851917
+
+// TruncateForTest wipes job_runs and jobs, resets their ID sequences, and
+// serializes against every OTHER test using this same call -- including
+// tests in a different PACKAGE, like cmd/api's. That last part is the
+// reason this exists at all: `go test ./...` runs different packages'
+// test binaries as genuinely concurrent OS processes, not goroutines in
+// one process, so two packages' tests truncating and asserting against
+// the same live shared table race exactly like two goroutines would
+// without a mutex -- one process's insert can land in the middle of
+// another's truncate-then-assert window. A session-scoped Postgres
+// advisory lock (pg_advisory_lock) is the cross-process mutex: it blocks
+// until this caller is the only holder, tied to the one connection
+// acquired here rather than returned to the pool, so it stays held for
+// the whole test, not just this TRUNCATE statement -- the race this
+// defends against is "another process's insert happens mid-test", not
+// just "two truncates happen at once".
+//
+// The returned unlock func must be called when the test is done --
+// callers register it with t.Cleanup rather than this function taking
+// testing.TB itself, which would mean a non-test file importing
+// "testing".
+func (s *Store) TruncateForTest(ctx context.Context) (unlock func(), err error) {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("store: truncate for test: acquire: %w", err)
+	}
+
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", testLockKey); err != nil {
+		conn.Release()
+		return nil, fmt.Errorf("store: truncate for test: advisory lock: %w", err)
+	}
+	unlock = func() {
+		// A fresh, unbounded context: this runs from t.Cleanup, after
+		// the test's own ctx may already be cancelled, and unlocking is
+		// exactly the kind of cleanup that still needs to happen even
+		// then.
+		conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", testLockKey)
+		conn.Release()
+	}
+
+	if _, err := conn.Exec(ctx, "TRUNCATE TABLE job_runs, jobs RESTART IDENTITY CASCADE"); err != nil {
+		unlock()
+		return nil, fmt.Errorf("store: truncate for test: %w", err)
+	}
+
+	return unlock, nil
+}
