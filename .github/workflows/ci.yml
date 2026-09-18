@@ -170,6 +170,28 @@ jobs:
           docker exec "$kid" /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --list
           echo "::endgroup::"
 
+      # Where the client is stuck, not just what the broker saw. The
+      # broker's side of a hung run shows join and sync completing in
+      # milliseconds and then no further request at all until the client
+      # gives up -- so the interesting state is inside kafka-go, after it
+      # has its assignment and before it issues a fetch.
+      #
+      # -timeout 45s is the whole trick: it is shorter than the test's own
+      # 60s context, so the test binary panics while still stuck instead
+      # of the context expiring first and returning a tidy "deadline
+      # exceeded" that says nothing about where. A Go timeout panic dumps
+      # every goroutine's stack, which names the exact function the
+      # consumer is parked in.
+      #
+      # `|| true` because this step exists to collect evidence; the job
+      # has already failed and its verdict shouldn't depend on whether
+      # the hang reproduces on this second attempt.
+      - name: Goroutine dump from a hung consumer
+        if: failure()
+        run: |
+          go test -race -count=1 -run TestPublishConsumeRoundTrip -timeout 45s ./internal/queue/ 2>&1 \
+            | head -120 || true
+
   # Separate job, not a step: it needs no service containers and nothing
   # in it depends on the tests passing, so it runs in parallel and a
   # broken Dockerfile is reported at the same time as a broken test
