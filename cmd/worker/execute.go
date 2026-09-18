@@ -23,8 +23,8 @@ import (
 func execute(ctx context.Context, payload []byte) error {
 	var p struct {
 		Message string `json:"message"`
-		SleepMs int     `json:"sleep_ms"`
-		Fail    bool    `json:"fail"`
+		SleepMs int    `json:"sleep_ms"`
+		Fail    bool   `json:"fail"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return fmt.Errorf("execute: invalid payload: %w", err)

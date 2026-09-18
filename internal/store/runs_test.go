@@ -128,8 +128,8 @@ func TestClaimRunsNoDoubleClaim(t *testing.T) {
 
 	const numWorkers = 5
 	var (
-		wg      sync.WaitGroup
-		mu      sync.Mutex // guards claimedRuns below -- see note at the bottom
+		wg          sync.WaitGroup
+		mu          sync.Mutex // guards claimedRuns below -- see note at the bottom
 		claimedRuns []job.Run
 	)
 
