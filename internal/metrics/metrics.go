@@ -17,9 +17,12 @@
 package metrics
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -113,14 +116,76 @@ var (
 // all try the same default ORBIT_METRICS_ADDR unless given distinct
 // values, and a scheduler or worker whose metrics port lost that race
 // should still schedule and execute jobs correctly.
-func Serve(addr string) error {
+// It also serves two probe endpoints on the same listener, because
+// Kubernetes needs them and a second port for two trivial handlers would
+// be pure ceremony:
+//
+//   - /healthz is liveness. It checks nothing but itself: reaching it at
+//     all proves the process is up and its HTTP loop is still being
+//     scheduled. That is the only question liveness should ask, since a
+//     failed liveness probe gets the container KILLED -- wiring a
+//     dependency check to it means a Postgres blip restarts every pod in
+//     the fleet, turning a recoverable outage into a thundering herd.
+//
+//   - /readyz is readiness, and calls ready. A failed readiness probe
+//     only removes the pod from Service endpoints, so it is where a real
+//     dependency check belongs.
+//
+// ready may be nil, which reports ready unconditionally.
+//
+// What ready SHOULD check is a narrower question than "is every
+// dependency up". For this system it is Postgres alone, because Postgres
+// is the only dependency whose loss leaves a binary unable to do anything
+// at all. Kafka and Redis are deliberately excluded: the worker's
+// reconciliation sweep claims runs straight from Postgres when Kafka is
+// unreachable, and the rate limiter fails open when Redis is, so a pod
+// that has lost either is degraded but still working -- and marking it
+// unready would withdraw a pod that is actively making progress. etcd is
+// excluded for the scheduler on the same logic: losing it means the
+// process stays a follower, which is a correct state, not a broken one.
+func Serve(addr string, ready func(context.Context) error) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("metrics: listen on %s: %w", addr, err)
 	}
 
+	go http.Serve(ln, handler(ready))
+	return nil
+}
+
+// handler builds the mux Serve exposes. Split out from Serve so the probe
+// behaviour is testable without binding a port or dialling anything: the
+// interesting cases are what /readyz does with a check that fails, and
+// they shouldn't need a live Postgres to exercise.
+func handler(ready func(context.Context) error) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	go http.Serve(ln, mux)
-	return nil
+
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "ok\n")
+	})
+
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if ready == nil {
+			io.WriteString(w, "ok\n")
+			return
+		}
+		// Bounded independently of the caller: kubelet applies its own
+		// probe timeout, but a check left to block on an unreachable
+		// database would otherwise hold the handler goroutine well past
+		// the point the answer stopped being useful.
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		if err := ready(ctx); err != nil {
+			// The body is what shows up in `kubectl describe pod` when a
+			// probe fails, so it names the actual error rather than
+			// leaving an operator to guess which dependency is down.
+			http.Error(w, fmt.Sprintf("not ready: %v", err), http.StatusServiceUnavailable)
+			return
+		}
+		io.WriteString(w, "ok\n")
+	})
+
+	return mux
 }

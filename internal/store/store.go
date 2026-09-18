@@ -79,3 +79,16 @@ func New(ctx context.Context, dsn string) (*Store, error) {
 func (s *Store) Close() {
 	s.pool.Close()
 }
+
+// Ping reports whether Postgres is currently reachable, acquiring a
+// connection from the pool and round-tripping to the server rather than
+// just reporting that a pool object exists.
+//
+// This backs the readiness probe. Postgres is the one dependency whose
+// loss stops both binaries from doing anything useful at all: a scheduler
+// cannot materialize runs and a worker cannot claim or complete them. The
+// other dependencies deliberately do NOT gate readiness -- see the
+// comment on metrics.Serve for why.
+func (s *Store) Ping(ctx context.Context) error {
+	return s.pool.Ping(ctx)
+}

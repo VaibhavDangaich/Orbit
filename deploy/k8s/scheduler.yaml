@@ -45,23 +45,31 @@ spec:
           ports:
             - name: metrics
               containerPort: 9101
-          # No dedicated /healthz exists yet (a real gap, not hidden) --
-          # these reuse the /metrics endpoint that's already there. It's a
-          # valid liveness signal (proves the HTTP server goroutine is
-          # alive) but NOT a readiness signal for the things that actually
-          # matter (etcd/Postgres/Kafka reachability) -- a scheduler could
-          # report itself "ready" while unable to reach any of its
-          # dependencies. Documented in deploy/k8s/README.md as a known
-          # gap, not silently glossed over.
+          # Two different questions, so two different endpoints -- both
+          # served on the metrics port by internal/metrics.Serve.
+          #
+          # /healthz checks nothing but itself. A failed liveness probe
+          # KILLS the container, so making it depend on Postgres would
+          # turn a database blip into a fleet-wide restart: every pod
+          # killed at once, all reconnecting together, at the moment the
+          # database is already struggling.
           livenessProbe:
             httpGet:
-              path: /metrics
+              path: /healthz
               port: metrics
             initialDelaySeconds: 5
             periodSeconds: 10
+          # /readyz pings Postgres. A failed readiness probe only removes
+          # the pod from Service endpoints, which is the safe place for a
+          # dependency check.
+          #
+          # It deliberately does NOT check etcd. A scheduler that cannot
+          # reach etcd stays a follower, and a follower is a correct
+          # state, not a broken one -- exactly what the standby in this
+          # Deployment is meant to be.
           readinessProbe:
             httpGet:
-              path: /metrics
+              path: /readyz
               port: metrics
             initialDelaySeconds: 5
             periodSeconds: 10

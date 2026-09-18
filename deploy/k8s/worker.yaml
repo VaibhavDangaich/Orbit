@@ -35,16 +35,25 @@ spec:
           ports:
             - name: metrics
               containerPort: 9102
-          # Same reused-/metrics-endpoint caveat as orbit-scheduler.yaml.
+          # Same split as orbit-scheduler.yaml: /healthz checks nothing
+          # but itself so a dependency outage can't get the container
+          # killed, /readyz pings Postgres.
+          #
+          # Neither Kafka nor Redis gates readiness here, and that's the
+          # point rather than an omission. A worker that loses Kafka still
+          # claims runs through the Postgres reconciliation sweep, and one
+          # that loses Redis still executes because the rate limiter fails
+          # open. Marking either case unready would withdraw a worker that
+          # is actively getting work done.
           livenessProbe:
             httpGet:
-              path: /metrics
+              path: /healthz
               port: metrics
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
             httpGet:
-              path: /metrics
+              path: /readyz
               port: metrics
             initialDelaySeconds: 5
             periodSeconds: 10

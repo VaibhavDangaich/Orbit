@@ -87,15 +87,6 @@ func main() {
 		}
 	}()
 
-	// A failed bind here is logged, not fatal -- running several worker
-	// replicas on one machine for a local demo means they'd all try this
-	// same default port unless given distinct ORBIT_METRICS_ADDR values,
-	// and a worker whose metrics port lost that race should still claim
-	// and execute jobs correctly. See internal/metrics.Serve's comment.
-	if err := metrics.Serve(metricsAddr); err != nil {
-		log.Printf("metrics: %v (continuing without a working /metrics endpoint)", err)
-	}
-
 	startupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	s, err := store.New(startupCtx, dsn)
 	cancel()
@@ -103,6 +94,20 @@ func main() {
 		log.Fatalf("connect to postgres: %v", err)
 	}
 	defer s.Close()
+
+	// After store.New, not before: the readiness probe pings Postgres
+	// through s, so the server can only be started once s exists. Nothing
+	// is lost by waiting -- a worker that cannot reach Postgres exits on
+	// the line above rather than lingering to be scraped.
+	//
+	// A failed bind here is logged, not fatal -- running several worker
+	// replicas on one machine for a local demo means they'd all try this
+	// same default port unless given distinct ORBIT_METRICS_ADDR values,
+	// and a worker whose metrics port lost that race should still claim
+	// and execute jobs correctly. See internal/metrics.Serve's comment.
+	if err := metrics.Serve(metricsAddr, s.Ping); err != nil {
+		log.Printf("metrics: %v (continuing without /metrics or health endpoints)", err)
+	}
 
 	consumer := queue.NewConsumer(kafkaBrokers, kafkaGroup, queue.RunsTopic)
 	defer consumer.Close()

@@ -105,8 +105,8 @@ func main() {
 	// try this same default port unless given distinct ORBIT_METRICS_ADDR
 	// values, and a scheduler whose metrics port lost that race should
 	// still campaign, tick, and dispatch correctly.
-	if err := metrics.Serve(metricsAddr); err != nil {
-		log.Printf("metrics: %v (continuing without a working /metrics endpoint)", err)
+	if err := metrics.Serve(metricsAddr, s.Ping); err != nil {
+		log.Printf("metrics: %v (continuing without /metrics or health endpoints)", err)
 	}
 
 	log.Printf("started: poll_interval=%s batch_size=%d election_ttl=%s kafka_partitions=%d", pollInterval, batchSize, electionTTL, kafkaPartitions)
