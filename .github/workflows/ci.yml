@@ -148,6 +148,28 @@ jobs:
           ORBIT_TEST_REDIS_ADDR: 127.0.0.1:6380
         run: go test -race -count=1 ./...
 
+      # Runs only when the tests failed. Service containers are ordinary
+      # Docker containers on the runner, so the broker's own view of the
+      # world is available here -- which beats guessing at a consumer that
+      # hangs without ever returning an error.
+      - name: Kafka diagnostics on failure
+        if: failure()
+        run: |
+          kid=$(docker ps --filter "ancestor=apache/kafka:3.8.0" --format '{{.ID}}' | head -1)
+          echo "::group::broker log (tail)"
+          docker logs "$kid" 2>&1 | tail -60
+          echo "::endgroup::"
+          echo "::group::topics"
+          docker exec "$kid" /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+          echo "::endgroup::"
+          echo "::group::__consumer_offsets"
+          docker exec "$kid" /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+            --describe --topic __consumer_offsets 2>&1 | head -5
+          echo "::endgroup::"
+          echo "::group::consumer groups"
+          docker exec "$kid" /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --list
+          echo "::endgroup::"
+
   # Separate job, not a step: it needs no service containers and nothing
   # in it depends on the tests passing, so it runs in parallel and a
   # broken Dockerfile is reported at the same time as a broken test
