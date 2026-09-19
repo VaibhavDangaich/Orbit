@@ -16,19 +16,19 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strconv"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/vaibhavdangaich/orbit/internal/env"
 	"github.com/vaibhavdangaich/orbit/internal/store"
 )
 
 func main() {
-	dsn := envOr("ORBIT_DATABASE_URL", store.DefaultDevDSN)
-	refreshInterval := envDurationOr("ORBIT_TUI_REFRESH_INTERVAL", 2*time.Second)
-	jobLimit := envIntOr("ORBIT_TUI_JOB_LIMIT", 50)
-	runWindow := envIntOr("ORBIT_TUI_RUN_WINDOW", 500)
+	dsn := env.Or("ORBIT_DATABASE_URL", store.DefaultDevDSN)
+	refreshInterval := env.DurationOr("ORBIT_TUI_REFRESH_INTERVAL", 2*time.Second)
+	jobLimit := env.IntOr("ORBIT_TUI_JOB_LIMIT", 50)
+	runWindow := env.IntOr("ORBIT_TUI_RUN_WINDOW", 500)
 
 	startupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	s, err := store.New(startupCtx, dsn)
@@ -47,35 +47,4 @@ func main() {
 		fmt.Fprintf(os.Stderr, "orbit-tui: %v\n", err)
 		os.Exit(1)
 	}
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func envDurationOr(key string, def time.Duration) time.Duration {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		log.Fatalf("invalid %s=%q: %v", key, v, err)
-	}
-	return d
-}
-
-func envIntOr(key string, def int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		log.Fatalf("invalid %s=%q: %v", key, v, err)
-	}
-	return n
 }

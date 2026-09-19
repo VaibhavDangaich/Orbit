@@ -32,7 +32,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -42,6 +41,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
+	"github.com/vaibhavdangaich/orbit/internal/env"
 	"github.com/vaibhavdangaich/orbit/internal/job"
 	"github.com/vaibhavdangaich/orbit/internal/metrics"
 	"github.com/vaibhavdangaich/orbit/internal/queue"
@@ -56,19 +56,19 @@ import (
 var tracer = otel.Tracer("orbit/worker")
 
 func main() {
-	workerID := envOr("ORBIT_WORKER_ID", defaultWorkerID())
+	workerID := env.Or("ORBIT_WORKER_ID", defaultWorkerID())
 	log.SetPrefix(fmt.Sprintf("[worker %s] ", workerID))
 
-	dsn := envOr("ORBIT_DATABASE_URL", store.DefaultDevDSN)
-	lease := envDurationOr("ORBIT_LEASE", 30*time.Second)
-	sweepInterval := envDurationOr("ORBIT_SWEEP_INTERVAL", 30*time.Second)
-	sweepBatchSize := envIntOr("ORBIT_BATCH_SIZE", 10)
-	kafkaBrokers := strings.Split(envOr("ORBIT_KAFKA_BROKERS", strings.Join(queue.DefaultDevBrokers, ",")), ",")
-	kafkaGroup := envOr("ORBIT_KAFKA_GROUP", "orbit-workers")
-	redisAddr := envOr("ORBIT_REDIS_ADDR", ratelimit.DefaultDevAddr)
-	rateLimitPerTenant := envIntOr("ORBIT_RATE_LIMIT_PER_TENANT", 10)
-	metricsAddr := envOr("ORBIT_METRICS_ADDR", ":9102")
-	otlpEndpoint := envOr("ORBIT_OTLP_ENDPOINT", "localhost:4317")
+	dsn := env.Or("ORBIT_DATABASE_URL", store.DefaultDevDSN)
+	lease := env.DurationOr("ORBIT_LEASE", 30*time.Second)
+	sweepInterval := env.DurationOr("ORBIT_SWEEP_INTERVAL", 30*time.Second)
+	sweepBatchSize := env.IntOr("ORBIT_BATCH_SIZE", 10)
+	kafkaBrokers := strings.Split(env.Or("ORBIT_KAFKA_BROKERS", strings.Join(queue.DefaultDevBrokers, ",")), ",")
+	kafkaGroup := env.Or("ORBIT_KAFKA_GROUP", "orbit-workers")
+	redisAddr := env.Or("ORBIT_REDIS_ADDR", ratelimit.DefaultDevAddr)
+	rateLimitPerTenant := env.IntOr("ORBIT_RATE_LIMIT_PER_TENANT", 10)
+	metricsAddr := env.Or("ORBIT_METRICS_ADDR", ":9102")
+	otlpEndpoint := env.Or("ORBIT_OTLP_ENDPOINT", "localhost:4317")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -319,35 +319,4 @@ func defaultWorkerID() string {
 		host = "unknown"
 	}
 	return fmt.Sprintf("%s-%d", host, os.Getpid())
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func envDurationOr(key string, def time.Duration) time.Duration {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		log.Fatalf("invalid %s=%q: %v", key, v, err)
-	}
-	return d
-}
-
-func envIntOr(key string, def int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		log.Fatalf("invalid %s=%q: %v", key, v, err)
-	}
-	return n
 }

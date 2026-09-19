@@ -16,12 +16,12 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/vaibhavdangaich/orbit/internal/election"
+	"github.com/vaibhavdangaich/orbit/internal/env"
 	"github.com/vaibhavdangaich/orbit/internal/metrics"
 	"github.com/vaibhavdangaich/orbit/internal/queue"
 	"github.com/vaibhavdangaich/orbit/internal/store"
@@ -29,19 +29,19 @@ import (
 )
 
 func main() {
-	nodeID := envOr("ORBIT_NODE_ID", defaultNodeID())
+	nodeID := env.Or("ORBIT_NODE_ID", defaultNodeID())
 	log.SetPrefix(fmt.Sprintf("[scheduler %s] ", nodeID))
 
-	dsn := envOr("ORBIT_DATABASE_URL", store.DefaultDevDSN)
-	pollInterval := envDurationOr("ORBIT_POLL_INTERVAL", 5*time.Second)
-	batchSize := envIntOr("ORBIT_BATCH_SIZE", 50)
-	etcdEndpoints := strings.Split(envOr("ORBIT_ETCD_ENDPOINTS", "localhost:2379"), ",")
-	electionKey := envOr("ORBIT_ELECTION_KEY", "/orbit/scheduler-leader/")
-	electionTTL := envDurationOr("ORBIT_ELECTION_TTL", 10*time.Second)
-	kafkaBrokers := strings.Split(envOr("ORBIT_KAFKA_BROKERS", strings.Join(queue.DefaultDevBrokers, ",")), ",")
-	kafkaPartitions := envIntOr("ORBIT_KAFKA_PARTITIONS", 3)
-	metricsAddr := envOr("ORBIT_METRICS_ADDR", ":9101")
-	otlpEndpoint := envOr("ORBIT_OTLP_ENDPOINT", "localhost:4317")
+	dsn := env.Or("ORBIT_DATABASE_URL", store.DefaultDevDSN)
+	pollInterval := env.DurationOr("ORBIT_POLL_INTERVAL", 5*time.Second)
+	batchSize := env.IntOr("ORBIT_BATCH_SIZE", 50)
+	etcdEndpoints := strings.Split(env.Or("ORBIT_ETCD_ENDPOINTS", "localhost:2379"), ",")
+	electionKey := env.Or("ORBIT_ELECTION_KEY", "/orbit/scheduler-leader/")
+	electionTTL := env.DurationOr("ORBIT_ELECTION_TTL", 10*time.Second)
+	kafkaBrokers := strings.Split(env.Or("ORBIT_KAFKA_BROKERS", strings.Join(queue.DefaultDevBrokers, ",")), ",")
+	kafkaPartitions := env.IntOr("ORBIT_KAFKA_PARTITIONS", 3)
+	metricsAddr := env.Or("ORBIT_METRICS_ADDR", ":9101")
+	otlpEndpoint := env.Or("ORBIT_OTLP_ENDPOINT", "localhost:4317")
 
 	// signal.NotifyContext returns a context that's cancelled the moment
 	// this process receives SIGINT (Ctrl+C) or SIGTERM (what `docker stop`
@@ -219,35 +219,4 @@ func tick(ctx context.Context, s *store.Store, publisher *queue.Publisher, batch
 	} else if dispatched > 0 {
 		log.Printf("dispatched %d run(s) to kafka", dispatched)
 	}
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func envDurationOr(key string, def time.Duration) time.Duration {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		log.Fatalf("invalid %s=%q: %v", key, v, err)
-	}
-	return d
-}
-
-func envIntOr(key string, def int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		log.Fatalf("invalid %s=%q: %v", key, v, err)
-	}
-	return n
 }

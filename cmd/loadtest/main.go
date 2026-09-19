@@ -26,27 +26,28 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vaibhavdangaich/orbit/internal/env"
 	"github.com/vaibhavdangaich/orbit/internal/job"
 	"github.com/vaibhavdangaich/orbit/internal/store"
 )
 
 func main() {
-	dsn := envOr("ORBIT_DATABASE_URL", store.DefaultDevDSN)
-	n := envIntOr("ORBIT_LOADTEST_JOBS", 1000)
+	dsn := env.Or("ORBIT_DATABASE_URL", store.DefaultDevDSN)
+	n := env.IntOr("ORBIT_LOADTEST_JOBS", 1000)
 	// Spread across many tenants, not one: internal/ratelimit caps each
 	// tenant at ORBIT_RATE_LIMIT_PER_TENANT (default 10/s). Seeding all N
 	// jobs under a single tenant would measure that cap, not the
 	// scheduler/worker pipeline's real throughput -- a single-tenant run
 	// is its own, separate, useful measurement (see README), not this
 	// one's default.
-	numTenants := envIntOr("ORBIT_LOADTEST_TENANTS", 20)
-	timeout := envDurationOr("ORBIT_LOADTEST_TIMEOUT", 3*time.Minute)
+	numTenants := env.IntOr("ORBIT_LOADTEST_TENANTS", 20)
+	timeout := env.DurationOr("ORBIT_LOADTEST_TIMEOUT", 3*time.Minute)
 	// Printed alongside the results, not just used -- the whole point of
 	// stating these is that ORBIT_BATCH_SIZE/ORBIT_POLL_INTERVAL bound
 	// materialize throughput BY CONSTRUCTION (batch_size runs picked up
 	// per poll_interval). A P99 quoted without them is unfalsifiable.
-	pollInterval := envDurationOr("ORBIT_POLL_INTERVAL", 5*time.Second)
-	batchSize := envIntOr("ORBIT_BATCH_SIZE", 50)
+	pollInterval := env.DurationOr("ORBIT_POLL_INTERVAL", 5*time.Second)
+	batchSize := env.IntOr("ORBIT_BATCH_SIZE", 50)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -208,35 +209,4 @@ func percentile(sorted []time.Duration, p int) time.Duration {
 		idx = len(sorted) - 1
 	}
 	return sorted[idx]
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func envIntOr(key string, def int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	var n int
-	if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
-		log.Fatalf("invalid %s=%q: %v", key, v, err)
-	}
-	return n
-}
-
-func envDurationOr(key string, def time.Duration) time.Duration {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		log.Fatalf("invalid %s=%q: %v", key, v, err)
-	}
-	return d
 }

@@ -21,16 +21,17 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vaibhavdangaich/orbit/internal/env"
 	"github.com/vaibhavdangaich/orbit/internal/metrics"
 	"github.com/vaibhavdangaich/orbit/internal/store"
 	"github.com/vaibhavdangaich/orbit/internal/tracing"
 )
 
 func main() {
-	dsn := envOr("ORBIT_DATABASE_URL", store.DefaultDevDSN)
-	addr := envOr("ORBIT_API_ADDR", ":8080")
-	metricsAddr := envOr("ORBIT_METRICS_ADDR", ":9103")
-	otlpEndpoint := envOr("ORBIT_OTLP_ENDPOINT", "localhost:4317")
+	dsn := env.Or("ORBIT_DATABASE_URL", store.DefaultDevDSN)
+	addr := env.Or("ORBIT_API_ADDR", ":8080")
+	metricsAddr := env.Or("ORBIT_METRICS_ADDR", ":9103")
+	otlpEndpoint := env.Or("ORBIT_OTLP_ENDPOINT", "localhost:4317")
 
 	log.SetPrefix("[api] ")
 
@@ -87,11 +88,4 @@ func main() {
 		log.Fatalf("listen: %v", err)
 	}
 	log.Printf("stopped")
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }
